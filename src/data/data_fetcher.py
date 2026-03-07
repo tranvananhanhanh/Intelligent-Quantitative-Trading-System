@@ -159,8 +159,8 @@ class FMPFetcher(BaseDataFetcher, DataSource):
 
     def __init__(self, cache_dir: str = "./data/cache"):
         super().__init__(cache_dir)
-        # self.base_url = "https://financialmodelingprep.com/api/v3"
-        self.base_url = "https://financialmodelingprep.com/stable/"
+        # Fix: Change from /stable/ to /api/v3
+        self.base_url = "https://financialmodelingprep.com/api/v3"
         # Offline mode when API key is not provided; computed lazily but default here
         self.api_key = self._get_api_key()
         self.offline_mode = not bool(self.api_key)
@@ -284,6 +284,15 @@ class FMPFetcher(BaseDataFetcher, DataSource):
                 except Exception as se:
                     logger.debug(f"Failed to save raw FMP payload {payload_key} for {ticker}: {se}")
             return data
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 403:
+                logger.warning(f"FMP API Forbidden (403) for {endpoint} {ticker} - likely requires premium subscription")
+                logger.info("Switching to offline mode for fundamental data")
+                self.offline_mode = True
+                return []
+            else:
+                logger.warning(f"Failed to fetch {endpoint} data for {ticker}: {e}")
+                return []
         except requests.exceptions.RequestException as e:
             logger.warning(f"Failed to fetch {endpoint} data for {ticker}: {e}")
             return []
@@ -902,138 +911,167 @@ class FMPFetcher(BaseDataFetcher, DataSource):
         data = response.json()
         return data
 
-    def get_price_data(self, tickers: pd.DataFrame,
-                      start_date: str, end_date: str) -> pd.DataFrame:
-        """Get price data from FMP with incremental updates."""
-
-        # If end_date is today in exchange timezone and current time is before market close,
-        # move end_date back by one day to avoid fetching incomplete day
-        now_local = pd.Timestamp.now(tz='America/New_York')
-        if now_local.date() <= pd.to_datetime(end_date).date():
-            schedule = mcal.get_calendar(name='NYSE').schedule(start_date=end_date, end_date=end_date, tz='America/New_York')
-
-            if not schedule.empty:
-                try:
-                    close_time = schedule['market_close'].iloc[-1]
-                    # If user asked up to today and before close, shift end_date back one day
-                    if now_local.time() < close_time.time():
-                        end_date = (now_local - pd.Timedelta(days=1)).strftime('%Y-%m-%d')
-                except Exception:
-                    pass
-
-        # Step 1: Check database for existing data
-        existing_data = self.data_store.get_price_data(tickers['tickers'], start_date, end_date)
+    def _get_price_data_from_fmp(self, tickers: pd.DataFrame,
+                                  start_date: str, end_date: str) -> pd.DataFrame:
+        """Get price data from FMP API."""
+        # Check database first
+        existing_data = self.data_store.get_price_data(
+            tickers['tickers'].tolist() if isinstance(tickers, pd.DataFrame) else list(tickers),
+            start_date,
+            end_date
+        )
         logger.info(f"Found {len(existing_data)} existing price records in database")
-
-        # Offline: return existing data only
+        
+        # If offline mode, return existing data only
         if self.offline_mode:
-            logger.info("Offline mode: returning existing price data from database and skipping remote fetch")
+            logger.info("Offline mode: returning existing price data from database")
             return existing_data
-
-        # Step 2: Identify tickers that need to be fetched
-        tickers_to_fetch = {}
-
-        # Bulk query for missing ranges to reduce overhead
-        try:
-            bulk_missing = self.data_store.get_missing_price_dates_bulk(tickers, start_date, end_date, exchange='NYSE')
-        except Exception as e:
-            logger.debug(f"bulk missing ranges failed, fallback to per-ticker: {e}")
-            bulk_missing = None
-
-        if bulk_missing is not None:
-            for t, ranges in (bulk_missing or {}).items():
-                if ranges:
-                    tickers_to_fetch[t] = ranges
-        else:
-            # Prepare per-ticker dateFirstAdded lookup
-            tickers_list = tickers['tickers'].astype(str).tolist() if isinstance(tickers, pd.DataFrame) else list(tickers)
-            if isinstance(tickers, pd.DataFrame) and 'dateFirstAdded' in tickers.columns:
-                dfa_map = {row['tickers']: row['dateFirstAdded'] for _, row in tickers[['tickers', 'dateFirstAdded']].iterrows()}
-            else:
-                dfa_map = {t: None for t in tickers_list}
-
-            def check_missing_ranges(ticker: str):
-                dfa_raw = dfa_map.get(ticker)
-                try:
-                    dfa = pd.to_datetime(dfa_raw, errors='coerce') if dfa_raw is not None else None
-                except Exception:
-                    dfa = None
-                eff_start_dt = max(pd.to_datetime(start_date), dfa) if dfa is not None else pd.to_datetime(start_date)
-                eff_start_str = eff_start_dt.strftime('%Y-%m-%d')
-
-                missing_ranges = self.data_store.get_missing_price_dates(ticker, eff_start_str, end_date, exchange='NYSE')
-                if missing_ranges:
-                    logger.info(f"Ticker {ticker}: Need to fetch price data")
-                    return (ticker, missing_ranges)
-                return None
-
-            with concurrent.futures.ThreadPoolExecutor() as executor:
-                results = list(executor.map(check_missing_ranges, tickers_list))
-
-            for res in results:
-                if res:
-                    ticker, missing_ranges = res
-                    tickers_to_fetch[ticker] = missing_ranges
-
-        # Step 3: Fetch missing data from API
+        
+        # Fetch missing data from FMP
+        ticker_list = tickers['tickers'].tolist() if isinstance(tickers, pd.DataFrame) else list(tickers)
         all_data = []
-        if tickers_to_fetch:
-            logger.info(f"Fetching price data for {len(tickers_to_fetch)} tickers from FMP")
-            
-            for ticker, date_ranges in tqdm(tickers_to_fetch.items()):
-                try:
-                    # 取最小和最大日期
-                    min_date = min(start for start, _ in date_ranges)
-                    max_date = max(end for _, end in date_ranges)
-
-                    url = f"{self.base_url}/historical-price-eod/full?symbol={ticker}?from={min_date}&to={max_date}&apikey={self.api_key}"
-                    response = requests.get(url)
-                    response.raise_for_status()
+        
+        for ticker in tqdm(ticker_list):
+            try:
+                url = f"{self.base_url}/historical-price-full/{ticker}?from={start_date}&to={end_date}&apikey={self.api_key}"
+                response = requests.get(url)
+                response.raise_for_status()
+                
+                data = response.json()
+                
+                if 'historical' in data:
+                    ticker_data = []
+                    for item in data['historical']:
+                        record = {
+                            'gvkey': ticker,
+                            'datadate': item['date'],
+                            'tic': ticker,
+                            'prccd': item['close'],
+                            'prcod': item['open'],
+                            'prchd': item['high'],
+                            'prcld': item['low'],
+                            'cshtrd': item['volume'],
+                            'adj_close': item.get('adjClose', item['close'])
+                        }
+                        ticker_data.append(record)
                     
-                    data = response.json()
+                    if ticker_data:
+                        all_data.extend(ticker_data)
+                        logger.debug(f"Fetched {len(ticker_data)} records for {ticker}")
+                else:
+                    logger.warning(f"No historical data for {ticker}")
                     
-                    if 'historical' in data:
-                        ticker_data = []
-                        for item in data['historical']:
-                            record = {
-                                'gvkey': ticker,
-                                'datadate': item['date'],
-                                'tic': ticker,
-                                'prccd': item['close'],
-                                'prcod': item['open'],
-                                'prchd': item['high'],
-                                'prcld': item['low'],
-                                'cshtrd': item['volume'],
-                                'adj_close': item.get('adjClose', item['close'])
-                            }
-                            ticker_data.append(record)
-                        
-                        if ticker_data:
-                            all_data.extend(ticker_data)
-                            logger.debug(f"Fetched {len(ticker_data)} records for {ticker} ({min_date} to {max_date})")
-                        else:
-                            logger.warning(f"No historical data for {ticker} ({min_date} to {max_date})")
-                    else:
-                        logger.warning(f"No historical data key in response for {ticker} ({min_date} to {max_date})")
-
-                except Exception as e:
-                    logger.warning(f"Failed to fetch price data for {ticker} ({min_date} to {max_date}): {e}")
-        else:
-            logger.warning(f"No price data to fetch")
-            return existing_data
-
-        # Step 4: Save new data to database
+            except Exception as e:
+                logger.warning(f"Failed to fetch FMP price data for {ticker}: {e}")
+                raise  # Re-raise to trigger Yahoo Finance fallback
+        
         if all_data:
             df = pd.DataFrame(all_data)
             df = self._standardize_price_data(df)
-            rows_saved = self.data_store.save_price_data(df)
-            logger.info(f"Saved {rows_saved} new price records to database")
-
-        # Step 5: Return combined data from database
-        final_data = self.data_store.get_price_data(tickers['tickers'].astype(str).tolist() if isinstance(tickers, pd.DataFrame) else list(tickers), start_date, end_date)
-        logger.info(f"Returning {len(final_data)} total price records")
+            self.data_store.save_price_data(df)
+            logger.info(f"Saved {len(df)} new price records to database")
         
-        return final_data
+        # Return combined data from database
+        return self.data_store.get_price_data(ticker_list, start_date, end_date)
+
+    def get_price_data(self, tickers: pd.DataFrame,
+                      start_date: str, end_date: str) -> pd.DataFrame:
+        """Get price data with Yahoo Finance fallback."""
+        
+        # Try FMP first
+        if not self.offline_mode and self.api_key:
+            try:
+                return self._get_price_data_from_fmp(tickers, start_date, end_date)
+            except Exception as e:
+                logger.warning(f"FMP failed: {e}, falling back to Yahoo Finance")
+        
+        # Fallback to Yahoo Finance
+        logger.info("Using Yahoo Finance for price data")
+        all_data = []
+        
+        # Handle both DataFrame and list input
+        if isinstance(tickers, pd.DataFrame):
+            ticker_list = tickers['tickers'].tolist()
+        elif isinstance(tickers, (list, pd.Series)):
+            ticker_list = list(tickers)
+        else:
+            ticker_list = [str(tickers)]
+        
+        # Fetch data for each ticker
+        for ticker in tqdm(ticker_list, desc="Fetching from Yahoo Finance"):
+            try:
+                df = yf.download(ticker, start=start_date, end=end_date, progress=False)
+                
+                # Check if DataFrame is empty
+                if df.empty:
+                    logger.warning(f"No data returned for {ticker}")
+                    continue
+                
+                # Reset index to get Date as a column
+                df = df.reset_index()
+                
+                # Standardize column names
+                column_mapping = {
+                    'Date': 'datadate',
+                    'Open': 'prcod',
+                    'High': 'prchd',
+                    'Low': 'prcld',
+                    'Close': 'prccd',
+                    'Adj Close': 'adj_close',
+                    'Volume': 'cshtrd'
+                }
+                df = df.rename(columns=column_mapping)
+                
+                # Add ticker columns
+                df['tic'] = ticker
+                df['gvkey'] = ticker
+                
+                # Ensure datadate is string format
+                if 'datadate' in df.columns:
+                    df['datadate'] = pd.to_datetime(df['datadate']).dt.strftime('%Y-%m-%d')
+                
+                # Ensure adj_close exists (fallback to prccd if missing)
+                if 'adj_close' not in df.columns:
+                    df['adj_close'] = df.get('prccd', np.nan)
+                
+                # Select only required columns in correct order
+                required_cols = ['tic', 'gvkey', 'datadate', 'prcod', 'prchd', 'prcld', 'prccd', 'adj_close', 'cshtrd']
+                
+                # Ensure all required columns exist (should already be there after rename)
+                missing_cols = [col for col in required_cols if col not in df.columns]
+                if missing_cols:
+                    logger.warning(f"Missing columns for {ticker}: {missing_cols}")
+                    for col in missing_cols:
+                        df[col] = np.nan if col not in ['tic', 'gvkey', 'datadate'] else ''
+                
+                # Keep only required columns
+                df = df[required_cols]
+                
+                all_data.append(df)
+                logger.debug(f"Fetched {len(df)} records for {ticker}")
+                
+            except Exception as e:
+                logger.warning(f"Yahoo Finance failed for {ticker}: {e}")
+                continue
+        
+        if all_data:
+            # Concatenate all dataframes
+            result = pd.concat(all_data, ignore_index=True)
+            
+            # Sort by ticker and date
+            result = result.sort_values(['tic', 'datadate']).reset_index(drop=True)
+            
+            # Save to database
+            try:
+                self.data_store.save_price_data(result)
+                logger.info(f"Saved {len(result)} price records to database")
+            except Exception as e:
+                logger.error(f"Failed to save price data to database: {e}")
+            
+            return result
+        
+        logger.warning("No price data fetched from any source")
+        return pd.DataFrame()
 
 
 class DataSourceManager:
