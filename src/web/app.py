@@ -22,6 +22,11 @@ import json
 # Add src directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+# Get project root directory (parent of src/)
+PROJECT_ROOT = Path(__file__).parent.parent
+DATA_DIR = PROJECT_ROOT / "data"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
 # Import project modules with individual try-except
 from config.settings import get_config
 
@@ -235,13 +240,26 @@ def show_data_management():
                 with st.spinner("Fetching fundamental data..."):
                     try:
                         from data.data_fetcher import fetch_fundamental_data
+                        from data.data_quality import DataQualityChecker
+                        from pathlib import Path
+                        
                         tickers = ['AAPL', 'MSFT', 'GOOGL']
                         fundamentals = fetch_fundamental_data(
                             tickers, '2020-01-01', '2023-12-31'
                         )
+                        
                         if len(fundamentals) > 0:
-                            st.success(f"Successfully fetched {len(fundamentals)} records")
+                            # Save to CSV automatically (use absolute path from PROJECT_ROOT)
+                            csv_path = DATA_DIR / 'fundamentals.csv'
+                            fundamentals.to_csv(csv_path, index=False)
+                            
+                            st.success(f"✓ Successfully fetched {len(fundamentals)} records")
+                            st.info(f"💾 Saved to `{csv_path}`")
                             st.dataframe(fundamentals.head(10), use_container_width=True)
+                            
+                            # Store in session state for later use
+                            st.session_state['fundamentals_data'] = fundamentals
+                            st.session_state['fundamentals_path'] = str(csv_path)
                         else:
                             st.warning("No data returned. Loading sample data...")
                             # Create sample fundamental data
@@ -250,7 +268,7 @@ def show_data_management():
                                 'date': ['2023-09-30', '2022-09-30', '2023-06-30', '2022-06-30', '2023-09-30', '2022-09-30'],
                                 'revenue': [383285, 365817, 52857, 51865, 76691, 69787],
                                 'netIncome': [96995, 99803, 16425, 16425, 12213, 13615],
-                                'totalAssets': [352,755, 352,755, 411,975, 411,975, 402,392, 402,392]
+                                'totalAssets': [352755, 352755, 411975, 411975, 402392, 402392]
                             })
                             st.success(f"Loaded {len(sample_data)} sample records")
                             st.dataframe(sample_data, use_container_width=True)
@@ -272,25 +290,113 @@ def show_data_management():
             with st.spinner("Processing data..."):
                 try:
                     from data.data_processor import process_fundamentals, process_prices
+                    from data.data_fetcher import fetch_price_data
+                    
+                    fund_path = DATA_DIR / "fundamentals.csv"
+                    prices_path = DATA_DIR / "prices.csv"
+                    
+                    # Check if fundamentals exist
+                    if not fund_path.exists():
+                        st.warning(f"⚠️ Fundamentals file not found!")
+                        st.info("""
+                        **Solution:** 
+                        1. Go to **Data Sources** tab
+                        2. Click **"Fetch Fundamental Data"**
+                        3. Return to this tab to process
+                        """)
+                        return
 
-                    # Process sample data
-                    fundamentals = process_fundamentals("./data/fundamentals.csv")
-                    prices = process_prices("./data/prices.csv")
+                    # Load fundamentals to get tickers and date range
+                    fundamentals_raw = pd.read_csv(fund_path)
+                    st.write(f"📊 Loaded fundamentals.csv: {len(fundamentals_raw)} rows, {fundamentals_raw.shape[1]} columns")
+                    if len(fundamentals_raw) == 0:
+                        st.warning("⚠️ Fundamentals CSV is empty!")
+                        return
+                    
+                    # Auto-fetch price data if missing
+                    if not prices_path.exists():
+                        st.info("💾 Price data not found, auto-fetching...")
+                        try:
+                            # Get unique tickers and date range from fundamentals
+                            tickers_list = fundamentals_raw['tic'].unique() if 'tic' in fundamentals_raw.columns else \
+                                          fundamentals_raw['symbol'].unique() if 'symbol' in fundamentals_raw.columns else []
+                            
+                            date_col = 'datadate' if 'datadate' in fundamentals_raw.columns else 'date'
+                            dates = pd.to_datetime(fundamentals_raw[date_col])
+                            start_date = dates.min().strftime('%Y-%m-%d')
+                            end_date = dates.max().strftime('%Y-%m-%d')
+                            
+                            st.write(f"Fetching prices for {len(tickers_list)} tickers from {start_date} to {end_date}...")
+                            
+                            prices = fetch_price_data(list(tickers_list), start_date, end_date)
+                            if len(prices) > 0:
+                                prices.to_csv(prices_path, index=False)
+                                st.success(f"✓ Auto-fetched {len(prices)} price records")
+                            else:
+                                st.warning("⚠️ Could not fetch prices, using sample data")
+                                sample_prices = pd.DataFrame({
+                                    'gvkey': list(tickers_list) * 3,
+                                    'datadate': ['2023-12-29', '2023-06-30', '2023-01-03'] * len(list(tickers_list)),
+                                    'adj_close': [170.5, 160.2, 150.8] * len(list(tickers_list)),
+                                })
+                                sample_prices.to_csv(prices_path, index=False)
+                        except Exception as price_err:
+                            st.warning(f"⚠️ Auto-fetch failed: {str(price_err)[:100]}")
+                            st.info("Using sample price data for demo...")
+                            sample_prices = pd.DataFrame({
+                                'gvkey': ['AAPL', 'MSFT', 'GOOGL'] * 3,
+                                'datadate': ['2023-12-29', '2023-06-30', '2023-01-03'] * 3,
+                                'adj_close': [170.5, 339.2, 129.8] * 3,
+                            })
+                            sample_prices.to_csv(prices_path, index=False)
 
-                    st.success("Data processing completed")
-                    st.write(f"Processed {len(fundamentals)} fundamental records")
-                    st.write(f"Processed {len(prices)} price records")
+                    # Process data
+                    st.write("⏳ Processing fundamentals...")
+                    fundamentals = process_fundamentals(str(fund_path))
+                    st.write(f"✓ Processed {len(fundamentals)} fundamental records")
+                    
+                    st.write("⏳ Processing prices...")
+                    prices = process_prices(str(prices_path))
+                    st.write(f"✓ Processed {len(prices)} price records")
+                    
+                    if len(fundamentals) == 0 or len(prices) == 0:
+                        st.warning("⚠️ Processed data is empty! Check input files.")
+                        return
+
+                    st.success("✓ Data processing completed successfully")
 
                 except Exception as e:
-                    st.error(f"Data processing failed: {e}")
+                    st.error(f"Data processing failed: {type(e).__name__}: {str(e)}")
+                    st.info(f"""
+                    **Debug Info:**
+                    - Fundamentals path: `{fund_path}`
+                    - Fundamentals exists: {fund_path.exists()}
+                    - Prices path: `{prices_path}`
+                    - Prices exists: {prices_path.exists()}
+                    
+                    If files exist but processing fails, try:
+                    1. Click "Fetch Fundamental Data" again to refresh
+                    2. Or delete CSV files and start over
+                    """)
+                    import traceback
+                    logger.error(traceback.format_exc())
 
         if st.button("Generate ML Dataset"):
             with st.spinner("Creating ML dataset..."):
                 try:
                     from data.data_processor import create_ml_dataset
+                    from pathlib import Path
 
-                    X, y = create_ml_dataset("./data/fundamentals.csv", "./data/prices.csv")
-                    st.success("ML dataset created")
+                    fund_path = DATA_DIR / "fundamentals.csv"
+                    prices_path = DATA_DIR / "prices.csv"
+                    
+                    if not fund_path.exists() or not prices_path.exists():
+                        st.warning(f"⚠️ Data files not found! Please process data first.")
+                        st.info(f"Expected paths:\n- {fund_path}\n- {prices_path}")
+                        return
+
+                    X, y = create_ml_dataset(str(fund_path), str(prices_path))
+                    st.success("✓ ML dataset created")
                     st.write(f"Features shape: {X.shape}")
                     st.write(f"Target shape: {y.shape}")
 
@@ -302,30 +408,191 @@ def show_data_management():
 
         # Display storage stats
         stats = st.session_state.data_store.get_storage_stats()
-        st.json(stats)
+        
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("Files", stats['total_files'])
+        with col2:
+            st.metric("Storage (MB)", f"{stats['total_size_mb']:.2f}")
+        with col3:
+            st.metric("Price Records", f"{stats['price_records']:,}")
+        with col4:
+            st.metric("Database", "SQLite")
+        
+        st.divider()
+        
+        # Database path info
+        st.info(f"📁 Database: `{stats['database_path']}`")
 
-        if st.button("Cleanup Expired Cache"):
+        if st.button("🧹 Cleanup Expired Cache (30+ days old)"):
             with st.spinner("Cleaning up cache..."):
                 try:
-                    st.session_state.data_store.cleanup_expired_cache()
-                    st.success("Cache cleanup completed")
+                    deleted = st.session_state.data_store.cleanup_expired_cache(days_old=30)
+                    st.success("✓ Cache cleanup completed")
+                    st.json({
+                        'deleted_price_data': deleted.get('price_data', 0),
+                        'deleted_news_articles': deleted.get('news_articles', 0),
+                        'deleted_raw_payloads': deleted.get('raw_payloads', 0),
+                        'total_deleted': sum(deleted.values())
+                    })
                 except Exception as e:
                     st.error(f"Cache cleanup failed: {e}")
 
     with tab4:
-        st.subheader("Data Quality")
+        st.subheader("📊 Data Quality Assessment")
+        
+        # Quick explanation
+        with st.expander("ℹ️ How Data Quality Scoring Works"):
+            st.markdown("""
+            **4 Quality Dimensions:**
+            
+            1. **Completeness** - % of non-null values
+               - 100% = All values present
+               - <70% = Too many missing values
+            
+            2. **Accuracy** - Outlier detection + range validation
+               - PE > 0, Revenue > 0 (Fundamentals)
+               - High ≥ Low, OHLC valid (Prices)
+            
+            3. **Consistency** - Format & type consistency
+               - Valid date format (YYYY-MM-DD)
+               - Numeric columns are numbers
+               - No duplicate rows
+            
+            4. **Timeliness** - Data recency
+               - 100% = ≤ 1 day old
+               - 70% = ≤ 1 month old
+               - 20% = > 3 months old
+            """)
+        
+        st.divider()
 
-        # Data quality checks
-        st.subheader("Data Quality Metrics")
+        # Load data files
+        fund_path = DATA_DIR / "fundamentals.csv"
+        prices_path = DATA_DIR / "prices.csv"
 
-        # Sample quality metrics
-        quality_data = pd.DataFrame({
-            'Metric': ['Completeness', 'Accuracy', 'Consistency', 'Timeliness'],
-            'Score': [95.2, 98.1, 92.3, 99.8],
-            'Status': ['Good', 'Excellent', 'Good', 'Excellent']
-        })
+        # Auto-assess if data exists
+        fund_exists = fund_path.exists()
+        prices_exists = prices_path.exists()
 
-        st.dataframe(quality_data, use_container_width=True)
+        if st.button("🔍 Assess Data Quality", use_container_width=True):
+            if not fund_exists and not prices_exists:
+                st.error("❌ No data files found!")
+                st.info("📌 Please fetch and process data first in the **Data Sources** and **Data Processing** tabs")
+                st.stop()
+            
+            with st.spinner("Analyzing data quality..."):
+                try:
+                    from data.data_quality import assess_data_quality, DataQualityChecker
+                    
+                    results = assess_data_quality(
+                        fundamentals_path=fund_path if fund_exists else None,
+                        prices_path=prices_path if prices_exists else None
+                    )
+                    
+                    checker = DataQualityChecker()
+                    
+                    # Create columns for side-by-side display
+                    col1, col2 = st.columns(2)
+                    
+                    # ===== FUNDAMENTAL DATA QUALITY =====
+                    if results.get('fundamentals') and fund_exists:
+                        with col1:
+                            st.subheader("📈 Fundamental Data")
+                            fund_scores = results['fundamentals']
+                            
+                            # Overall score box
+                            overall = fund_scores['overall']
+                            status, emoji = checker.score_to_status(overall)
+                            
+                            st.metric(
+                                f"{emoji} Overall Quality",
+                                f"{overall:.1f}%",
+                                f"Status: {status}"
+                            )
+                            
+                            # Breakdown table
+                            breakdown_df = pd.DataFrame({
+                                'Dimension': ['Completeness', 'Accuracy', 'Consistency', 'Timeliness'],
+                                'Score': [
+                                    f"{fund_scores['completeness']:.1f}%",
+                                    f"{fund_scores['accuracy']:.1f}%",
+                                    f"{fund_scores['consistency']:.1f}%",
+                                    f"{fund_scores['timeliness']:.1f}%"
+                                ],
+                                'Status': [
+                                    checker.score_to_status(fund_scores['completeness'])[0],
+                                    checker.score_to_status(fund_scores['accuracy'])[0],
+                                    checker.score_to_status(fund_scores['consistency'])[0],
+                                    checker.score_to_status(fund_scores['timeliness'])[0]
+                                ]
+                            })
+                            st.dataframe(breakdown_df, use_container_width=True)
+                            st.caption(f"📦 Records: {fund_scores.get('record_count', 'N/A')}")
+                    
+                    # ===== PRICE DATA QUALITY =====
+                    if results.get('prices') and prices_exists:
+                        with col2:
+                            st.subheader("💹 Price Data")
+                            price_scores = results['prices']
+                            
+                            # Overall score box
+                            overall = price_scores['overall']
+                            status, emoji = checker.score_to_status(overall)
+                            
+                            st.metric(
+                                f"{emoji} Overall Quality",
+                                f"{overall:.1f}%",
+                                f"Status: {status}"
+                            )
+                            
+                            # Breakdown table
+                            breakdown_df = pd.DataFrame({
+                                'Dimension': ['Completeness', 'Accuracy', 'Consistency', 'Timeliness'],
+                                'Score': [
+                                    f"{price_scores['completeness']:.1f}%",
+                                    f"{price_scores['accuracy']:.1f}%",
+                                    f"{price_scores['consistency']:.1f}%",
+                                    f"{price_scores['timeliness']:.1f}%"
+                                ],
+                                'Status': [
+                                    checker.score_to_status(price_scores['completeness'])[0],
+                                    checker.score_to_status(price_scores['accuracy'])[0],
+                                    checker.score_to_status(price_scores['consistency'])[0],
+                                    checker.score_to_status(price_scores['timeliness'])[0]
+                                ]
+                            })
+                            st.dataframe(breakdown_df, use_container_width=True)
+                            st.caption(f"📦 Records: {price_scores.get('record_count', 'N/A')}")
+                    
+                    # ===== RECOMMENDATIONS =====
+                    st.divider()
+                    st.subheader("💡 Recommendations")
+                    
+                    rec_col1, rec_col2 = st.columns(2)
+                    
+                    if fund_exists and results.get('fundamentals'):
+                        with rec_col1:
+                            overall = results['fundamentals']['overall']
+                            if overall >= 80:
+                                st.success("✅ Fundamental data is GOOD - ready for model training")
+                            elif overall >= 60:
+                                st.warning("⚠️ Fundamental data is FAIR - review before production use")
+                            else:
+                                st.error("❌ Fundamental data quality is POOR - needs improvement")
+                    
+                    if prices_exists and results.get('prices'):
+                        with rec_col2:
+                            overall = results['prices']['overall']
+                            if overall >= 80:
+                                st.success("✅ Price data is GOOD - ready for backtesting")
+                            elif overall >= 60:
+                                st.warning("⚠️ Price data is FAIR - review before backtesting")
+                            else:
+                                st.error("❌ Price data quality is POOR - needs improvement")
+                        
+                except Exception as e:
+                    st.error(f"❌ Quality assessment failed: {e}")
 
 
 def show_strategy_backtesting():
