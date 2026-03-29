@@ -1009,7 +1009,12 @@ class FMPFetcher(BaseDataFetcher, DataSource):
                 
                 # Reset index to get Date as a column
                 df = df.reset_index()
-                
+
+                # Flatten MultiIndex columns produced by newer yfinance versions
+                # e.g. ('Open', 'AAPL') → 'Open'
+                if isinstance(df.columns, pd.MultiIndex):
+                    df.columns = [col[0] for col in df.columns]
+
                 # Standardize column names
                 column_mapping = {
                     'Date': 'datadate',
