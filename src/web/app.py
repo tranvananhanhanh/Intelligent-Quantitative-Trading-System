@@ -115,7 +115,7 @@ def display_quick_stats():
         with col2:
             st.metric("Cache Entries", stats.get('cache_entries', 0))
 
-        st.metric("Storage Used", ".1f")
+        st.metric("Storage Used", f"{stats.get('total_size_mb', 0):.1f} MB")
 
     except Exception as e:
         st.error(f"Could not load stats: {e}")
@@ -384,13 +384,14 @@ def show_strategy_backtesting():
             # Key metrics
             metrics_cols = st.columns(4)
             with metrics_cols[0]:
-                st.metric("Final Value", ".2f")
+                final_val = result.portfolio_values.iloc[-1] if hasattr(result, 'portfolio_values') and len(result.portfolio_values) > 0 else result.metrics.get('final_value', 0)
+                st.metric("Final Value", f"${float(final_val):,.2f}")
             with metrics_cols[1]:
-                st.metric("Total Return", ".2%")
+                st.metric("Total Return", f"{result.metrics.get('total_return', 0):.2%}")
             with metrics_cols[2]:
-                st.metric("Annual Return", ".2%")
+                st.metric("Annual Return", f"{result.annualized_return:.2%}")
             with metrics_cols[3]:
-                st.metric("Sharpe Ratio", ".2f")
+                st.metric("Sharpe Ratio", f"{result.metrics.get('sharpe_ratio', 0):.2f}")
 
             # Performance chart
             if hasattr(result, 'portfolio_values'):
@@ -405,7 +406,7 @@ def show_strategy_backtesting():
             st.subheader("Detailed Metrics")
             metrics_df = pd.DataFrame({
                 'Metric': list(result.metrics.keys()),
-                'Value': [".4f" for v in result.metrics.values()]
+                'Value': [f"{v:.4f}" for v in result.metrics.values()]
             })
             st.dataframe(metrics_df)
 
@@ -461,7 +462,7 @@ def show_live_trading():
         account = create_alpaca_account_from_env()
         st.success(f"Connected to Alpaca account (Paper: {account.is_paper})")
 
-        tab1, tab2, tab3 = st.tabs(["Portfolio", "Order Management", "Strategy Execution"])
+        tab1, tab2, tab3, tab4 = st.tabs(["Portfolio", "Order Management", "Strategy Execution", "Performance Monitoring"])
 
         with tab1:
             st.subheader("Current Portfolio")
@@ -478,11 +479,11 @@ def show_live_trading():
 
                         col1, col2, col3 = st.columns(3)
                         with col1:
-                            st.metric("Portfolio Value", ".2f")
+                            st.metric("Portfolio Value", f"${float(account_info.get('portfolio_value', 0)):,.2f}")
                         with col2:
-                            st.metric("Cash", ".2f")
+                            st.metric("Cash", f"${float(account_info.get('cash', 0)):,.2f}")
                         with col3:
-                            st.metric("Buying Power", ".2f")
+                            st.metric("Buying Power", f"${float(account_info.get('buying_power', 0)):,.2f}")
 
                         # Positions table
                         if positions:
@@ -532,37 +533,484 @@ def show_live_trading():
 
         with tab3:
             st.subheader("Strategy Execution")
-            st.info("Strategy execution feature coming soon. Please check the Jupyter notebook examples for detailed strategy implementation.")
-            # with st.button("Execute Sample Strategy"):
-            #     with st.spinner("Executing strategy..."):
-            #         try:
-            #             from ..trading.trade_executor import TradeExecutor
-            #             from ..strategies.base_strategy import StrategyConfig, EqualWeightStrategy
-            #
-            #             manager = AlpacaManager([account])
-            #             executor = TradeExecutor(manager)
-            #
-            #             # Create sample strategy
-            #             config = StrategyConfig(name="Sample Equal Weight")
-            #             strategy = EqualWeightStrategy(config)
-            #
-            #             # Sample data
-            #             sample_data = {
-            #                 'fundamentals': pd.DataFrame({
-            #                     'gvkey': ['AAPL', 'MSFT', 'GOOGL'],
-            #                     'datadate': ['2024-01-01'] * 3
-            #                 })
-            #             }
-            #
-            #             result = executor.execute_strategy(strategy, sample_data)
-            #             st.success(f"Strategy executed: {len(result.orders_placed)} orders placed")
-            #
-            #         except Exception as e:
-            #             st.error(f"Strategy execution failed: {e}")
+            _show_strategy_execution(account)
+
+        with tab4:
+            st.subheader("Performance Monitoring")
+            _show_performance_monitoring(account)
 
     except Exception as e:
         st.error(f"Trading not configured: {e}")
         st.info("Please set up Alpaca API credentials in environment variables")
+
+
+def _show_performance_monitoring(account):
+    """Render the Performance Monitoring tab inside Live Trading."""
+    from trading.alpaca_manager import AlpacaManager
+    from trading.performance_analyzer import (
+        get_first_order_date, get_portfolio_history,
+        get_benchmark_data, compute_performance_metrics,
+    )
+
+    manager = AlpacaManager([account])
+
+    # ── Date range ─────────────────────────────────────────────────────────────
+    col_d1, col_d2, col_d3 = st.columns([1, 1, 1])
+    with col_d1:
+        auto_start = st.checkbox("Tự động lấy ngày đầu tiên có lệnh", value=True)
+    with col_d2:
+        manual_start = st.date_input(
+            "Từ ngày", value=datetime.today() - timedelta(days=30),
+            disabled=auto_start, key="pm_start"
+        )
+    with col_d3:
+        end_date_input = st.date_input("Đến ngày", value=datetime.today(), key="pm_end")
+
+    if st.button("🔄 Tải dữ liệu", type="primary"):
+        with st.spinner("Đang tải portfolio history và benchmark..."):
+            try:
+                import pytz
+                utc = pytz.utc
+                end_dt   = datetime.combine(end_date_input, datetime.min.time()).replace(tzinfo=utc)
+
+                if auto_start:
+                    first_date = get_first_order_date(manager)
+                    if first_date is None:
+                        st.warning("Chưa có lệnh nào trong tài khoản. Chọn ngày thủ công.")
+                        return
+                    start_dt = first_date - timedelta(days=1)
+                else:
+                    start_dt = datetime.combine(manual_start, datetime.min.time()).replace(tzinfo=utc)
+
+                portfolio_df = get_portfolio_history(manager, start_dt, end_dt)
+                fmp_end      = (end_date_input + timedelta(days=1)).strftime("%Y-%m-%d")
+                benchmark_df = get_benchmark_data(start_dt.date().isoformat(), fmp_end)
+
+                if portfolio_df.empty:
+                    st.warning("Không có dữ liệu portfolio history trong khoảng thời gian này.")
+                    return
+
+                # ── Metrics ───────────────────────────────────────────────────
+                st.markdown("#### Chỉ số hiệu suất")
+                equity_series = portfolio_df.set_index("date")["equity"]
+                pm = compute_performance_metrics(equity_series)
+
+                cols_m = st.columns(5)
+                cols_m[0].metric("Total Return",      f"{pm['total_return']:.2%}")
+                cols_m[1].metric("Annual Return",     f"{pm['annual_return']:.2%}")
+                cols_m[2].metric("Volatility (Ann.)", f"{pm['annual_volatility']:.2%}")
+                cols_m[3].metric("Sharpe Ratio",      f"{pm['sharpe_ratio']:.2f}")
+                cols_m[4].metric("Max Drawdown",      f"{pm['max_drawdown']:.2%}")
+
+                # Benchmark metrics
+                if not benchmark_df.empty:
+                    bm_cols = st.columns(len(benchmark_df.columns))
+                    for i, bm in enumerate(benchmark_df.columns):
+                        bm_series = benchmark_df[bm].dropna()
+                        if len(bm_series) > 1:
+                            bm_m = compute_performance_metrics(bm_series)
+                            with bm_cols[i]:
+                                st.markdown(f"**{bm}**: Return {bm_m['total_return']:.2%} | "
+                                            f"Sharpe {bm_m['sharpe_ratio']:.2f} | "
+                                            f"MaxDD {bm_m['max_drawdown']:.2%}")
+
+                st.divider()
+
+                # ── Equity curve vs benchmarks ────────────────────────────────
+                st.markdown("#### Equity Curve so với Benchmark")
+                fig = go.Figure()
+
+                # Normalize to 1.0
+                eq = equity_series.dropna()
+                if len(eq) > 0:
+                    eq_norm = eq / eq.iloc[0]
+                    fig.add_trace(go.Scatter(
+                        x=eq_norm.index, y=eq_norm.values,
+                        name="Portfolio", line=dict(width=2, color="#2962FF")
+                    ))
+
+                colors = {"SPY": "#FF6D00", "QQQ": "#00BFA5"}
+                if not benchmark_df.empty:
+                    for bm in benchmark_df.columns:
+                        bm_s = benchmark_df[bm].dropna()
+                        if len(bm_s) > 0:
+                            bm_norm = bm_s / bm_s.iloc[0]
+                            fig.add_trace(go.Scatter(
+                                x=bm_norm.index, y=bm_norm.values,
+                                name=bm, line=dict(dash="dash", color=colors.get(bm, "gray"))
+                            ))
+
+                fig.update_layout(
+                    title="Normalized Performance (Base = 1.0)",
+                    xaxis_title="Date", yaxis_title="Return",
+                    hovermode="x unified", height=400,
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02)
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+                # ── Daily P&L chart ───────────────────────────────────────────
+                st.markdown("#### P&L hàng ngày")
+                pnl = portfolio_df.set_index("date")["profit_loss"].dropna()
+                if len(pnl) > 0:
+                    bar_colors = ["#00C853" if v >= 0 else "#D50000" for v in pnl.values]
+                    fig2 = go.Figure(go.Bar(
+                        x=pnl.index, y=pnl.values,
+                        marker_color=bar_colors,
+                        name="Daily P&L"
+                    ))
+                    fig2.update_layout(
+                        title="Daily Profit / Loss (USD)",
+                        xaxis_title="Date", yaxis_title="P&L ($)",
+                        height=300
+                    )
+                    st.plotly_chart(fig2, use_container_width=True)
+
+                # ── Positions table ───────────────────────────────────────────
+                st.markdown("#### Vị thế hiện tại")
+                positions = manager.get_positions()
+                if positions:
+                    pos_df = pd.DataFrame(positions)
+                    display_cols = [c for c in
+                        ["symbol", "qty", "avg_entry_price", "current_price",
+                         "market_value", "unrealized_pl", "unrealized_plpc"]
+                        if c in pos_df.columns]
+                    pos_df_show = pos_df[display_cols].copy()
+                    for col in ["avg_entry_price", "current_price", "market_value"]:
+                        if col in pos_df_show.columns:
+                            pos_df_show[col] = pd.to_numeric(pos_df_show[col], errors="coerce")
+                    for col in ["unrealized_pl", "unrealized_plpc"]:
+                        if col in pos_df_show.columns:
+                            pos_df_show[col] = pd.to_numeric(pos_df_show[col], errors="coerce")
+
+                    def _color_pnl(val):
+                        try:
+                            return "color: green" if float(val) >= 0 else "color: red"
+                        except:
+                            return ""
+
+                    fmt = {}
+                    for c in ["avg_entry_price", "current_price", "market_value"]:
+                        if c in pos_df_show.columns:
+                            fmt[c] = "${:.2f}"
+                    if "unrealized_pl" in pos_df_show.columns:
+                        fmt["unrealized_pl"] = "${:+.2f}"
+                    if "unrealized_plpc" in pos_df_show.columns:
+                        fmt["unrealized_plpc"] = "{:+.2%}"
+
+                    styled = pos_df_show.style.format(fmt)
+                    if "unrealized_pl" in pos_df_show.columns:
+                        styled = styled.applymap(_color_pnl, subset=["unrealized_pl"])
+
+                    st.dataframe(styled, use_container_width=True, height=350)
+
+                    # ── P&L bar chart per symbol ──────────────────────────────
+                    if "unrealized_pl" in pos_df_show.columns:
+                        pnl_sym = pos_df_show[["symbol", "unrealized_pl"]].copy()
+                        pnl_sym["unrealized_pl"] = pd.to_numeric(pnl_sym["unrealized_pl"], errors="coerce")
+                        pnl_sym = pnl_sym.sort_values("unrealized_pl")
+                        bar_c = ["#00C853" if v >= 0 else "#D50000" for v in pnl_sym["unrealized_pl"]]
+                        fig3 = go.Figure(go.Bar(
+                            x=pnl_sym["symbol"], y=pnl_sym["unrealized_pl"],
+                            marker_color=bar_c
+                        ))
+                        fig3.update_layout(
+                            title="Unrealized P&L theo cổ phiếu",
+                            xaxis_title="Symbol", yaxis_title="Unrealized P&L ($)",
+                            height=350
+                        )
+                        st.plotly_chart(fig3, use_container_width=True)
+                else:
+                    st.info("Chưa có vị thế nào. Lệnh OPG sẽ khớp khi thị trường mở cửa.")
+
+            except Exception as e:
+                st.error(f"Lỗi tải dữ liệu: {e}")
+                import traceback
+                with st.expander("Chi tiết lỗi"):
+                    st.code(traceback.format_exc())
+    else:
+        st.info("Nhấn **Tải dữ liệu** để xem hiệu suất portfolio.")
+
+
+def _show_strategy_execution(account):
+    """Render the Strategy Execution tab inside Live Trading."""
+    from trading.alpaca_manager import AlpacaManager
+
+    manager = AlpacaManager([account])
+
+    # ETF / index tickers to always exclude from individual stock orders
+    _ETF_EXCLUDE = {"SPY", "QQQ", "IVV", "VOO", "VTI", "IWM", "DIA", "GLD", "SLV", "TLT", "BND"}
+
+    def _parse_weights_csv(raw: pd.DataFrame):
+        """Convert CSV (wide or long) → DataFrame[gvkey, weight] + latest_date."""
+        if "gvkey" in raw.columns and "weight" in raw.columns:
+            raw["date"] = pd.to_datetime(raw["date"])
+            latest = raw["date"].max()
+            df = raw[raw["date"] == latest][["gvkey", "weight"]].copy()
+        else:
+            raw["date"] = pd.to_datetime(raw["date"])
+            latest = raw["date"].max()
+            row = raw[raw["date"] == latest].drop(columns=["date"])
+            df = (
+                row.T.reset_index()
+                .rename(columns={"index": "gvkey", row.index[0]: "weight"})
+            )
+            df["weight"] = pd.to_numeric(df["weight"], errors="coerce").fillna(0.0)
+        df = df[df["weight"] > 0].copy()
+        return df, latest
+
+    # ── 0. Run ML Strategy ────────────────────────────────────────────────────
+    with st.expander("🤖 Chạy ML Strategy để tạo weights mới", expanded=False):
+        fund_path = Path("data/fundamentals.csv")
+
+        if not fund_path.exists():
+            st.warning("`data/fundamentals.csv` chưa tồn tại.")
+            if st.button("📥 Tạo fundamentals.csv từ database", type="secondary"):
+                with st.spinner("Đang tổng hợp dữ liệu cơ bản từ database (có thể mất vài phút)..."):
+                    try:
+                        from data.data_fetcher import fetch_sp500_tickers, fetch_fundamental_data
+                        tickers_df = fetch_sp500_tickers()
+                        fundamentals = fetch_fundamental_data(
+                            tickers_df, '2015-10-15', '2025-10-15', align_quarter_dates=True
+                        )
+                        if fundamentals.empty:
+                            st.error("Không lấy được dữ liệu. Kiểm tra database hoặc chạy notebook cell 4+5.")
+                        else:
+                            fund_path.parent.mkdir(parents=True, exist_ok=True)
+                            fundamentals.to_csv(fund_path, index=False)
+                            st.success(
+                                f"Đã tạo `{fund_path}` với {len(fundamentals)} dòng / "
+                                f"{fundamentals['gvkey'].nunique()} cổ phiếu. "
+                                "Bấm lại expander để chạy ML."
+                            )
+                            st.rerun()
+                    except Exception as e:
+                        st.error(f"Lỗi tạo fundamentals: {e}")
+                        import traceback
+                        with st.expander("Chi tiết lỗi"):
+                            st.code(traceback.format_exc())
+        else:
+            st.success(f"Tìm thấy `{fund_path}` — sẵn sàng chạy ML.")
+            col_cfg1, col_cfg2, col_cfg3 = st.columns(3)
+            with col_cfg1:
+                ml_top_q = st.slider("Top Quantile", 0.5, 1.0, 0.9, 0.05,
+                                     help="Ngưỡng chọn cổ phiếu (0.9 = top 10%)")
+            with col_cfg2:
+                ml_test_q = st.number_input("Test Quarters", 1, 8, 4,
+                                            help="Số quý dùng để test")
+            with col_cfg3:
+                ml_weight_method = st.selectbox("Weight Method",
+                                                ["equal", "min_variance"])
+            ml_exec_date = st.date_input(
+                "Execution Date (ngày chốt danh mục)",
+                value=datetime.today(),
+                help="Ngày bạn muốn xác nhận danh mục hôm nay",
+            )
+
+            if st.button("▶ Chạy ML Strategy", type="primary"):
+                with st.spinner("Đang huấn luyện mô hình và chọn cổ phiếu..."):
+                    try:
+                        from strategies.ml_strategy import MLStockSelectionStrategy
+                        from strategies.base_strategy import StrategyConfig
+
+                        fundamentals = pd.read_csv(fund_path)
+                        if len(fundamentals) == 0:
+                            st.error("File fundamentals.csv trống.")
+                        else:
+                            config = StrategyConfig(
+                                name="ML Stock Selection",
+                                description="Dashboard ML run"
+                            )
+                            strategy = MLStockSelectionStrategy(config)
+                            result = strategy.generate_weights(
+                                data={"fundamentals": fundamentals},
+                                prediction_mode="single",
+                                test_quarters=int(ml_test_q),
+                                top_quantile=float(ml_top_q),
+                                weight_method=ml_weight_method,
+                                confirm_mode="today",
+                                execution_date=ml_exec_date.strftime("%Y-%m-%d"),
+                            )
+
+                            weights_out = result.weights
+                            if weights_out.empty:
+                                st.error("Mô hình không chọn được cổ phiếu nào. Thử hạ Top Quantile.")
+                            else:
+                                out_path = Path("data/ml_weights_today.csv")
+                                weights_out.to_csv(out_path, index=False)
+                                st.success(
+                                    f"Đã chọn **{len(weights_out)}** cổ phiếu và lưu vào "
+                                    f"`{out_path}`. Kéo xuống mục Load để xem kết quả."
+                                )
+                                st.dataframe(
+                                    weights_out[["gvkey", "weight", "predicted_return"]]
+                                    .sort_values("weight", ascending=False)
+                                    .style.format({"weight": "{:.2%}", "predicted_return": "{:.4f}"}),
+                                    use_container_width=True,
+                                    height=250,
+                                )
+                    except Exception as e:
+                        st.error(f"Lỗi chạy ML: {e}")
+                        import traceback
+                        with st.expander("Chi tiết lỗi"):
+                            st.code(traceback.format_exc())
+
+    # ── 1. Load weights ────────────────────────────────────────────────────────
+    st.markdown("#### 1. Load Portfolio Weights")
+
+    load_source = st.radio(
+        "Weights source",
+        ["File trong data/", "Upload CSV"],
+        horizontal=True,
+    )
+
+    weights_df = None
+    latest_date = None
+
+    if load_source.startswith("File"):
+        # Scan data/ for candidate CSV files
+        data_dir = Path("data")
+        csv_files = sorted(data_dir.glob("*.csv")) if data_dir.exists() else []
+        weight_files = [f for f in csv_files if "weight" in f.name.lower() or "ml_" in f.name.lower()]
+        if not weight_files:
+            weight_files = [f for f in csv_files if f.name != "sp500_tickers.csv"]
+
+        if not weight_files:
+            st.warning("Không tìm thấy file weights trong `data/`. Chạy notebook cell 6 trước.")
+        else:
+            selected_file = st.selectbox(
+                "Chọn file weights",
+                options=weight_files,
+                format_func=lambda p: p.name,
+            )
+            try:
+                raw = pd.read_csv(selected_file)
+                weights_df, latest_date = _parse_weights_csv(raw)
+                st.success(
+                    f"Đã load **{len(weights_df)}** cổ phiếu từ `{selected_file.name}` "
+                    f"(ngày: {latest_date.date()})"
+                )
+            except Exception as e:
+                st.error(f"Lỗi đọc file: {e}")
+    else:
+        uploaded = st.file_uploader("Upload file CSV (wide hoặc long format)", type=["csv"])
+        if uploaded:
+            try:
+                raw = pd.read_csv(uploaded)
+                weights_df, latest_date = _parse_weights_csv(raw)
+                st.success(f"Uploaded **{len(weights_df)}** cổ phiếu (ngày: {latest_date.date()}).")
+            except Exception as e:
+                st.error(f"File không hợp lệ: {e}")
+
+    if weights_df is None or weights_df.empty:
+        st.info("Load hoặc upload file weights CSV để tiếp tục.")
+        return
+
+    # ── Cảnh báo equal-weight ──────────────────────────────────────────────────
+    n_unique_w = weights_df["weight"].nunique()
+    if n_unique_w == 1 and len(weights_df) > 50:
+        st.warning(
+            f"**Cảnh báo:** Tất cả {len(weights_df)} cổ phiếu có weight bằng nhau "
+            f"({weights_df['weight'].iloc[0]:.4f}). "
+            "Đây có thể là output backtest, không phải ML selection. "
+            "Hãy chạy lại cell 6 notebook với `prediction_mode='single'` "
+            "để lấy danh sách cổ phiếu ML đã chọn (~51 stocks)."
+        )
+
+    # ── Loại bỏ ETF + lọc Top N ───────────────────────────────────────────────
+    weights_df = weights_df[~weights_df["gvkey"].isin(_ETF_EXCLUDE)].copy()
+
+    col_f1, col_f2 = st.columns([2, 1])
+    with col_f1:
+        max_stocks = len(weights_df)
+        default_n = min(51, max_stocks)
+        top_n_filter = st.slider(
+            "Giữ lại Top N cổ phiếu (theo weight)",
+            min_value=5, max_value=max_stocks, value=default_n, step=1,
+        )
+    with col_f2:
+        st.metric("Tổng cổ phiếu sau lọc", f"{top_n_filter} / {max_stocks}")
+
+    weights_df = weights_df.nlargest(top_n_filter, "weight").copy()
+    total = weights_df["weight"].sum()
+    if total > 0:
+        weights_df["weight"] = weights_df["weight"] / total
+
+    # ── 2. Preview weights ─────────────────────────────────────────────────────
+    st.markdown("#### 2. Weights Preview")
+    col_tbl, col_chart = st.columns([1, 1])
+
+    with col_tbl:
+        st.dataframe(
+            weights_df.sort_values("weight", ascending=False)
+            .style.format({"weight": "{:.2%}"}),
+            use_container_width=True,
+            height=300,
+        )
+
+    with col_chart:
+        chart_data = weights_df.nlargest(10, "weight").copy()
+        others_w = 1.0 - chart_data["weight"].sum()
+        if others_w > 1e-4:
+            chart_data = pd.concat(
+                [chart_data, pd.DataFrame([{"gvkey": "Others", "weight": others_w}])],
+                ignore_index=True,
+            )
+        fig = px.pie(chart_data, names="gvkey", values="weight",
+                     title=f"Top-10 Allocation ({top_n_filter} stocks)", hole=0.35)
+        fig.update_traces(textposition="inside", textinfo="percent+label")
+        fig.update_layout(showlegend=False, margin=dict(t=40, b=0, l=0, r=0))
+        st.plotly_chart(fig, use_container_width=True)
+
+    target_weights = {
+        str(r["gvkey"]): float(r["weight"])
+        for _, r in weights_df.iterrows()
+    }
+
+    # ── 3. Execution settings ──────────────────────────────────────────────────
+    st.markdown("#### 3. Execution Settings")
+    col_s1, col_s2 = st.columns(2)
+    with col_s1:
+        dry_run = st.checkbox("Dry Run (chỉ xem kế hoạch, không đặt lệnh)", value=True)
+    with col_s2:
+        closed_action = st.selectbox(
+            "Market-closed action",
+            ["opg", "skip"],
+            index=0,
+            help="opg = đặt lệnh limit-on-open phiên hôm sau; skip = bỏ qua",
+        )
+
+    # ── 4. Execute ─────────────────────────────────────────────────────────────
+    st.markdown("#### 4. Execute")
+    btn_label = "Preview Plan (Dry Run)" if dry_run else "Submit Orders"
+    if st.button(btn_label, type="primary"):
+        with st.spinner("Đang xử lý…"):
+            try:
+                plan = manager.execute_portfolio_rebalance(
+                    target_weights,
+                    account_name="default",
+                    dry_run=dry_run,
+                    market_closed_action=closed_action if not dry_run else "opg",
+                )
+
+                if dry_run:
+                    st.success("Dry-run plan đã tạo xong.")
+                    col_a, col_b, col_c = st.columns(3)
+                    col_a.metric("Market Open", str(plan.get("market_open", "—")))
+                    col_b.metric("Planned Buys", len(plan.get("orders_plan", {}).get("buy", [])))
+                    col_c.metric("Planned Sells", len(plan.get("orders_plan", {}).get("sell", [])))
+                    with st.expander("Full Plan JSON"):
+                        st.json(plan)
+                else:
+                    n = plan.get("orders_placed", 0)
+                    st.success(f"Đã đặt **{n}** lệnh.")
+                    with st.expander("Execution Result"):
+                        st.json(plan)
+
+            except Exception as e:
+                st.error(f"Execution thất bại: {e}")
+                import traceback
+                with st.expander("Chi tiết lỗi"):
+                    st.code(traceback.format_exc())
 
 
 def show_portfolio_analysis():
