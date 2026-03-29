@@ -706,6 +706,50 @@ class DataStore:
             'database_path': str(self.db_path)
         }
 
+    def cleanup_expired_cache(self, days_old: int = 30) -> Dict[str, int]:
+        """
+        Clean up old cached data records.
+        
+        Args:
+            days_old: Delete records older than this many days (default: 30 days)
+            
+        Returns:
+            Dictionary with counts of deleted records by type
+        """
+        import sqlite3
+        from datetime import datetime, timedelta
+        
+        cutoff_date = (datetime.now() - timedelta(days=days_old)).isoformat()
+        deleted_counts = {}
+        
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                
+                # Delete old price data
+                cursor.execute("DELETE FROM price_data WHERE created_at < ?", (cutoff_date,))
+                deleted_counts['price_data'] = cursor.rowcount
+                
+                # Delete old news articles with no sentiment analysis
+                cursor.execute(
+                    "DELETE FROM news_articles WHERE created_at < ? AND sentiment IS NULL",
+                    (cutoff_date,)
+                )
+                deleted_counts['news_articles'] = cursor.rowcount
+                
+                # Delete old raw payloads
+                cursor.execute("DELETE FROM raw_payloads WHERE created_at < ?", (cutoff_date,))
+                deleted_counts['raw_payloads'] = cursor.rowcount
+                
+                conn.commit()
+                
+            logger.info(f"Cache cleanup completed. Deleted: {deleted_counts}")
+            return deleted_counts
+            
+        except Exception as e:
+            logger.error(f"Cache cleanup failed: {e}")
+            raise
+
     # =========================
     # Raw fundamentals helpers
     # =========================
