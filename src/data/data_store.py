@@ -159,80 +159,88 @@ class DataStore:
             conn.commit()
             logger.info(f"Initialized database at {self.db_path}")
 
+    def _get_connection(self) -> sqlite3.Connection:
+        """Get database connection."""
+        return sqlite3.connect(self.db_path)
 
-    def save_price_data(self, df: pd.DataFrame) -> int:
-        """
-        Save price data to database (upsert).
-        
-        Args:
-            df: DataFrame with columns: ticker, datadate, prcod, prchd, prcld, prccd, adj_close, cshtrd
-            
-        Returns:
-            Number of rows inserted/updated
-        """
+    def save_price_data(self, df: pd.DataFrame) -> None:
+        """Save price data to database."""
         if df.empty:
-            return 0
+            return
         
-        # Standardize column names
-        df = df.copy()
-        column_mapping = {
-            'tic': 'ticker',
-            'datadate': 'date',
-            'prcod': 'open',
-            'prchd': 'high',
-            'prcld': 'low',
-            'prccd': 'close',
-            'cshtrd': 'volume'
-        }
+        conn = self._get_connection()
+        cursor = conn.cursor()
         
-        for old_col, new_col in column_mapping.items():
-            if old_col in df.columns and new_col not in df.columns:
-                df = df.rename(columns={old_col: new_col})
-        
-        # Ensure required columns exist
-        required_cols = ['ticker', 'date', 'open', 'high', 'low', 'close', 'adj_close', 'volume']
-        for col in required_cols:
-            if col not in df.columns:
-                if col == 'ticker':
-                    df['ticker'] = df.get('gvkey', 'UNKNOWN')
-                elif col == 'date':
-                    df['date'] = df.index if isinstance(df.index, pd.DatetimeIndex) else df.get('datadate')
-                else:
-                    df[col] = np.nan
-        
-        # Convert date to string format
-        if not isinstance(df['date'].iloc[0], str):
-            df['date'] = pd.to_datetime(df['date']).dt.strftime('%Y-%m-%d')
-        
-        rows_affected = 0
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
-            
-            for _, row in df.iterrows():
+        try:
+            for idx, row in df.iterrows():
                 try:
+                    # Extract scalar values from Series to avoid ambiguity
+                    ticker_val = row['tic'] if 'tic' in row else None
+                    datadate_val = row['datadate'] if 'datadate' in row else None
+                    
+                    # Convert to string and check for None/NaN
+                    if ticker_val is None or (isinstance(ticker_val, float) and pd.isna(ticker_val)):
+                        logger.debug(f"Skipping row {idx} with missing ticker")
+                        continue
+                    if datadate_val is None or (isinstance(datadate_val, float) and pd.isna(datadate_val)):
+                        logger.debug(f"Skipping row {idx} with missing datadate")
+                        continue
+                    
+                    ticker = str(ticker_val)
+                    datadate = str(datadate_val)
+                    
+                    # Extract numeric values - use direct indexing to get scalar values
+                    def safe_float(val):
+                        """Convert value to float, return None if invalid."""
+                        if val is None:
+                            return None
+                        # Handle pandas Series (use iloc[0] to extract scalar)
+                        if isinstance(val, pd.Series):
+                            if val.empty:
+                                return None
+                            val = val.iloc[0]
+                        if isinstance(val, (int, float)):
+                            return None if pd.isna(val) else float(val)
+                        try:
+                            return float(val)
+                        except (ValueError, TypeError):
+                            return None
+                    
+                    prcod = safe_float(row.get('prcod'))
+                    prchd = safe_float(row.get('prchd'))
+                    prcld = safe_float(row.get('prcld'))
+                    prccd = safe_float(row.get('prccd'))
+                    adj_close = safe_float(row.get('adj_close'))
+                    cshtrd = safe_float(row.get('cshtrd'))
+                    
                     cursor.execute('''
                         INSERT OR REPLACE INTO price_data 
                         (ticker, date, open, high, low, close, adj_close, volume)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     ''', (
-                        row['ticker'],
-                        row['date'],
-                        float(row['open']) if pd.notna(row['open']) else None,
-                        float(row['high']) if pd.notna(row['high']) else None,
-                        float(row['low']) if pd.notna(row['low']) else None,
-                        float(row['close']) if pd.notna(row['close']) else None,
-                        float(row['adj_close']) if pd.notna(row['adj_close']) else None,
-                        float(row['volume']) if pd.notna(row['volume']) else None
+                        ticker,
+                        datadate,
+                        prcod,
+                        prchd,
+                        prcld,
+                        prccd,
+                        adj_close,
+                        cshtrd
                     ))
-                    rows_affected += 1
                 except Exception as e:
-                    logger.warning(f"Failed to save price data for {row.get('ticker')} on {row.get('date')}: {e}")
+                    logger.error(f"Failed to insert row: {e}")
+                    logger.debug(f"Row data: {row.to_dict()}")
                     continue
             
             conn.commit()
-        
-        logger.info(f"Saved {rows_affected} price data records to database")
-        return rows_affected
+            logger.info(f"Saved {len(df)} price records to database")
+            
+        except Exception as e:
+            conn.rollback()
+            logger.error(f"Failed to save price data: {e}")
+            raise
+        finally:
+            conn.close()
 
     def get_price_data(self, tickers: List[str], start_date: str, end_date: str) -> pd.DataFrame:
         """

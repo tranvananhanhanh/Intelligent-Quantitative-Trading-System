@@ -169,7 +169,7 @@ def create_risk_metrics_table(metrics: Dict[str, float]):
             'Metric': list(performance_metrics.keys()),
             'Value': [".4f" for v in performance_metrics.values()]
         })
-        st.dataframe(perf_df, use_container_width=True)
+        st.dataframe(perf_df, width='stretch')
 
     with col2:
         st.subheader("Risk Metrics")
@@ -177,7 +177,7 @@ def create_risk_metrics_table(metrics: Dict[str, float]):
             'Metric': list(risk_metrics.keys()),
             'Value': [".4f" for v in risk_metrics.values()]
         })
-        st.dataframe(risk_df, use_container_width=True)
+        st.dataframe(risk_df, width='stretch')
 
 
 def create_sector_allocation_chart(positions: List[Dict[str, Any]],
@@ -259,7 +259,7 @@ def display_orders_table(orders: List[Dict[str, Any]], title: str = "Recent Orde
 
     orders_df = pd.DataFrame(display_orders)
     st.subheader(title)
-    st.dataframe(orders_df, use_container_width=True)
+    st.dataframe(orders_df, width='stretch')
 
 
 def create_correlation_heatmap(returns_data: Dict[str, pd.Series],
