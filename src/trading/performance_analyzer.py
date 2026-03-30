@@ -179,13 +179,15 @@ def _compute_daily_returns(series: pd.Series) -> pd.Series:
 
 def compute_performance_metrics(series: pd.Series, risk_free_rate: float = 0.02) -> Dict[str, float]:
     """Compute key performance metrics for a price/equity series.
-
-    Returns metrics as percentages for return/volatility/drawdown and raw value for Sharpe.
-    - total_return: %
-    - annual_return: % (geometric, annualized from daily returns)
-    - annual_volatility: % (std of daily returns * sqrt(252))
+    
+    Safely handles short time periods and edge cases (inf, nan, zero division).
+    
+    Returns metrics as percentages for return/volatility/drawdown.
+    - total_return: % (actual total return over period)
+    - annual_return: % (annualized, or total return if period < 10 days)
+    - annual_volatility: % (annualized volatility, 0 if insufficient data)
     - sharpe_ratio: (annual_return - rf) / annual_volatility
-    - max_drawdown: % (min drawdown)
+    - max_drawdown: % (maximum drawdown)
     """
     result = {
         'total_return': 0.0,
@@ -194,42 +196,62 @@ def compute_performance_metrics(series: pd.Series, risk_free_rate: float = 0.02)
         'sharpe_ratio': 0.0,
         'max_drawdown': 0.0,
     }
+    
     if series is None or len(series) < 2:
         return result
-
+    
+    # Remove NaN and zero values to avoid division by zero
     s = pd.Series(series).astype(float)
-    s = s.dropna()
+    s = s.replace(0, np.nan).dropna()
+    
     if len(s) < 2:
         return result
-
-    # Total return
-    total_return = (s.iloc[-1] / s.iloc[0] - 1.0) * 100.0
-
-    # Daily returns
-    daily_returns = s.pct_change().dropna()
-    n = len(daily_returns)
-    if n == 0:
-        result['total_return'] = float(total_return)
+    
+    # 1. Total Return (Lợi nhuận tổng)
+    start_price = s.iloc[0]
+    end_price = s.iloc[-1]
+    
+    if start_price <= 0:
+        logger.warning(f"⚠️ Warning: Invalid start price {start_price}. Cannot calculate returns.")
         return result
-
-    # Annualized return (geometric)
-    compounded = (1.0 + daily_returns).prod()
-    annual_return = (compounded ** (TRADING_DAYS_PER_YEAR / n) - 1.0) * 100.0
-
-    # Annualized volatility
-    annual_volatility = daily_returns.std(ddof=0) * np.sqrt(TRADING_DAYS_PER_YEAR) * 100.0
-
-    # Sharpe ratio (use annualized values; rf is annual decimal)
-    eps = 1e-12
+    
+    total_return = ((end_price / start_price) - 1.0) * 100.0
+    
+    # 2. Daily Returns
+    daily_returns = s.pct_change().dropna()
+    n_days = len(daily_returns)
+    
+    if n_days == 0:
+        result['total_return'] = float(total_return)
+        logger.warning(f"⚠️ Insufficient daily returns data (n={n_days})")
+        return result
+    
+    # 3. Annualization: Only if we have >10 trading days, otherwise use total return
+    # This prevents huge amplification of short-term volatility
+    if n_days > 10:
+        # Geometric compounding: (1 + r1) * (1 + r2) * ... * (1 + rn)
+        compounded = (1.0 + daily_returns).prod()
+        # Annualize: ((1 + compounded) ^ (252 / n)) - 1
+        annual_return = ((compounded) ** (TRADING_DAYS_PER_YEAR / n_days) - 1.0) * 100.0
+        annual_volatility = daily_returns.std() * np.sqrt(TRADING_DAYS_PER_YEAR) * 100.0
+        logger.info(f"✅ Sufficient data: {n_days} days. Using annualized metrics.")
+    else:
+        # Short period: use total return as annual return to avoid distortion
+        annual_return = total_return
+        annual_volatility = daily_returns.std() * np.sqrt(TRADING_DAYS_PER_YEAR) * 100.0 if n_days > 1 else 0.0
+        logger.warning(f"⚠️ Short period: {n_days} days only. Using total return as annual estimate. "
+                      f"Annualized metrics may be unreliable.")
+    
+    # 4. Sharpe Ratio (only if volatility > 0)
     sharpe_ratio = 0.0
-    if annual_volatility > eps:
+    if annual_volatility > 1e-12:
         sharpe_ratio = ((annual_return / 100.0) - float(risk_free_rate)) / (annual_volatility / 100.0)
-
-    # Max drawdown
+    
+    # 5. Max Drawdown
     rolling_max = s.cummax()
-    drawdown = s / rolling_max - 1.0
-    max_drawdown = float(drawdown.min()) * 100.0
-
+    drawdown = (s - rolling_max) / rolling_max * 100.0
+    max_drawdown = float(drawdown.min())
+    
     result.update({
         'total_return': float(total_return),
         'annual_return': float(annual_return),
@@ -237,6 +259,11 @@ def compute_performance_metrics(series: pd.Series, risk_free_rate: float = 0.02)
         'sharpe_ratio': float(sharpe_ratio),
         'max_drawdown': float(max_drawdown),
     })
+    
+    # Log summary
+    logger.info(f"📊 Performance Metrics: Total={total_return:.2f}%, Annual={annual_return:.2f}%, "
+               f"Vol={annual_volatility:.2f}%, Sharpe={sharpe_ratio:.2f}, MaxDD={max_drawdown:.2f}%")
+    
     return result
 
 def display_metrics_table(portfolio_df: pd.DataFrame, benchmark_df: pd.DataFrame, risk_free_rate: Optional[float] = None):
