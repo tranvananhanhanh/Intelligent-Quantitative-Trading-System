@@ -28,52 +28,139 @@ logger = logging.getLogger(__name__)
 TRADING_DAYS_PER_YEAR = 252
 
 def get_first_order_date(manager: AlpacaManager) -> Optional[datetime]:
-    """Get the date of the first order in the account using AlpacaManager."""
+    """Get the date of the first order in the account using AlpacaManager.
+    
+    Returns:
+        - If orders exist: first_order_date - 7 days (ensure Alpaca has "Base Equity" baseline)
+        - If no orders: account_creation_date - 1 day
+        - If error: datetime.now(utc) - 30 days (safe fallback)
+    """
     try:
         orders = manager.get_orders(status='closed', limit=1, direction='asc')
         if orders:
             first_order = orders[0]
-            return datetime.fromisoformat(first_order['submitted_at'].replace('Z', '+00:00'))
+            # Convert to pydatetime for compatibility
+            dt = pd.to_datetime(first_order['submitted_at']).to_pydatetime()
+            # Lùi 7 ngày để đảm bảo Alpaca có dữ liệu "Base Equity" trước khi trade
+            result = dt - timedelta(days=7)
+            logger.info(f"✅ First order found: {dt.date()}, using start_date: {result.date()}")
+            return result
         else:
-            logger.warning("No closed orders found. Using account creation date.")
+            logger.warning("⚠️ No closed orders found. Using account creation date.")
             account_info = manager.get_account_info()
-            creation_date = datetime.fromisoformat(account_info['created_at'].replace('Z', '+00:00'))
-            return creation_date
+            dt = pd.to_datetime(account_info['created_at']).to_pydatetime()
+            # Nếu chưa có lệnh, lấy ngày tạo account lùi 1 ngày
+            result = dt - timedelta(days=1)
+            logger.info(f"✅ Account created: {dt.date()}, using start_date: {result.date()}")
+            return result
     except Exception as e:
-        logger.error(f"Error getting first order date: {e}")
-        return None
+        logger.error(f"❌ Error getting first order date: {e}")
+        # Mặc định 30 ngày nếu có lỗi
+        fallback = datetime.now(timezone.utc) - timedelta(days=30)
+        logger.warning(f"⚠️ Using fallback start_date: {fallback.date()}")
+        return fallback
 
 def get_portfolio_history(manager: AlpacaManager, start_date: datetime, end_date: datetime) -> pd.DataFrame:
-    """Get portfolio history from start_date to end_date using AlpacaManager."""
-    history = manager.get_portfolio_history(
-        timeframe='1D',
-        date_start=start_date.date().isoformat(),
-        date_end=end_date.date().isoformat(),  
-        extended_hours=False
-    )
+    """Get portfolio history from start_date to end_date using AlpacaManager.
+    
+    Handles:
+    - Timezone issues: Converts to UTC and uses .date() to avoid time component confusion
+    - Weekend/Holiday: Automatically adjusts if needed
+    - Invalid date ranges: Ensures start_date < end_date before API call
+    """
+    # Normalize timezone to UTC
+    if start_date.tzinfo is None:
+        start_date = start_date.replace(tzinfo=timezone.utc)
+    if end_date.tzinfo is None:
+        end_date = end_date.replace(tzinfo=timezone.utc)
+    
+    # Convert to date strings (removes time component to avoid Alpaca timezone confusion)
+    s_str = start_date.date().isoformat()
+    e_str = end_date.date().isoformat()
+    
+    # VALIDATION: Ensure start < end (critical for Alpaca API)
+    if s_str > e_str:
+        logger.warning(f"❌ Invalid date range: start_date ({s_str}) > end_date ({e_str}). Adjusting start_date...")
+        start_date = end_date - timedelta(days=7)  # Use 7 days before end
+        s_str = start_date.date().isoformat()
+    elif s_str == e_str:
+        logger.warning(f"⚠️ start_date == end_date ({s_str}). Pushing start back 1 day for Alpaca portfolio history...")
+        start_date = end_date - timedelta(days=1)
+        s_str = start_date.date().isoformat()
+    
+    logger.info(f"📊 Fetching portfolio history from {s_str} to {e_str}")
+    
+    try:
+        history = manager.get_portfolio_history(
+            timeframe='1D',
+            date_start=s_str,
+            date_end=e_str,  
+            extended_hours=False
+        )
+    except Exception as e:
+        logger.error(f"❌ Failed to fetch portfolio history: {e}")
+        if "cannot be after" in str(e).lower():
+            logger.error("   Hint: Check that start_date < end_date and both are valid trading dates")
+        return pd.DataFrame()
+    
+    if not history or 'timestamp' not in history or len(history.get('equity', [])) == 0:
+        logger.warning(f"⚠️ No portfolio history returned for {s_str} to {e_str}")
+        return pd.DataFrame()
+    
     df = pd.DataFrame({
         'date': pd.to_datetime(history['timestamp'], unit='s'),
         'equity': history['equity'],
         'profit_loss': history['profit_loss'],
         'profit_loss_pct': history['profit_loss_pct']
     })
-    print(f"[DEBUG] Portfolio history from {df['date'].min().date()} to {df['date'].max().date()}")
-
+    logger.info(f"✅ Portfolio history retrieved: {len(df)} records from {df['date'].min().date()} to {df['date'].max().date()}")
     return df
 
 def get_benchmark_data(start_date: str, end_date: str) -> pd.DataFrame:
-    """Get historical price data for SPY and QQQ."""
-    #print(f"[DEBUG] Benchmark data from {start_date} to {end_date}")
-    print(f"***************start_date is {start_date}******************")
-    print(f"***************end_date is {end_date}******************")
-    df = fetch_price_data(['SPY', 'QQQ'], start_date, end_date)
-    df['date'] = pd.to_datetime(df['datadate'])
-    df = df.pivot(index='date', columns='tic', values='adj_close')
-    # 保留原有列名并明确列顺序，避免因列顺序变化导致 SPY/QQQ 对调
-    df = df[[c for c in ['SPY', 'QQQ'] if c in df.columns]]
-    print(df.tail(10))   
-
-    return df
+    """Get historical price data for SPY and QQQ.
+    
+    Args:
+        start_date: YYYY-MM-DD format
+        end_date: YYYY-MM-DD format
+    """
+    from datetime import datetime as dt_cls
+    
+    # Validate date format and range
+    try:
+        s = dt_cls.strptime(start_date, '%Y-%m-%d')
+        e = dt_cls.strptime(end_date, '%Y-%m-%d')
+        if s >= e:
+            logger.warning(f"⚠️ Benchmark: start_date ({start_date}) >= end_date ({end_date}). Adjusting...")
+            s = e - timedelta(days=7)
+            start_date = s.strftime('%Y-%m-%d')
+    except ValueError as ve:
+        logger.error(f"❌ Invalid date format. Expected YYYY-MM-DD. Error: {ve}")
+        return pd.DataFrame()
+    
+    logger.info(f"📈 Fetching benchmark data (SPY/QQQ) from {start_date} to {end_date}")
+    
+    try:
+        df = fetch_price_data(['SPY', 'QQQ'], start_date, end_date)
+        
+        if df.empty:
+            logger.warning(f"⚠️ No benchmark data returned for {start_date} to {end_date}")
+            return pd.DataFrame()
+        
+        df['date'] = pd.to_datetime(df['datadate'])
+        df = df.pivot(index='date', columns='tic', values='adj_close')
+        # 保留原有列名并明确列顺序，避免因列顺序变化导致 SPY/QQQ 对调
+        present_cols = [c for c in ['SPY', 'QQQ'] if c in df.columns]
+        if not present_cols:
+            logger.warning("⚠️ Neither SPY nor QQQ data found")
+            return pd.DataFrame()
+        
+        df = df[present_cols]
+        logger.info(f"✅ Benchmark data retrieved: {len(df)} records, columns: {list(df.columns)}")
+        return df
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to fetch benchmark data: {e}")
+        return pd.DataFrame()
 
 def calculate_returns(df: pd.DataFrame, column: str) -> float:
     """Calculate total return percentage."""

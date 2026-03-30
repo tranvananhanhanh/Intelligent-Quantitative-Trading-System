@@ -22,8 +22,8 @@ import json
 # Add src directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-# Get project root directory (parent of src/)
-PROJECT_ROOT = Path(__file__).parent.parent
+# Get project root directory (parent of src/) - should be 3 levels up from app.py
+PROJECT_ROOT = Path(__file__).parent.parent.parent
 DATA_DIR = PROJECT_ROOT / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -838,19 +838,44 @@ def _show_performance_monitoring(account):
             try:
                 import pytz
                 utc = pytz.utc
-                end_dt   = datetime.combine(end_date_input, datetime.min.time()).replace(tzinfo=utc)
-
+                
+                # === DATE HANDLING WITH TIMEZONE NORMALIZATION ===
+                # Chuẩn hóa end_dt: sử dụng cuối ngày hôm đó (23:59:59) để không mất dữ liệu
+                end_dt = datetime.combine(end_date_input, datetime.max.time()).replace(tzinfo=utc)
+                
+                # Xác định start_dt
                 if auto_start:
                     first_date = get_first_order_date(manager)
                     if first_date is None:
-                        st.warning("Chưa có lệnh nào trong tài khoản. Chọn ngày thủ công.")
-                        return
-                    start_dt = first_date - timedelta(days=1)
+                        st.warning("Chưa có lệnh nào trong tài khoản. Sử dụng mặc định: 30 ngày trước.")
+                        start_dt = end_dt - timedelta(days=30)
+                    else:
+                        # Đảm bảo first_date có timezone
+                        if first_date.tzinfo is None:
+                            first_date = first_date.replace(tzinfo=utc)
+                        # Lùi 1 ngày để có dữ liệu trước lệnh đầu tiên
+                        start_dt = first_date - timedelta(days=1)
                 else:
                     start_dt = datetime.combine(manual_start, datetime.min.time()).replace(tzinfo=utc)
-
+                
+                # === CRITICAL VALIDATION: Ensure start_date < end_date ===
+                if start_dt.date() >= end_dt.date():
+                    st.error(
+                        f"❌ Lỗi: Ngày bắt đầu ({start_dt.date()}) >= ngày kết thúc ({end_dt.date()}). "
+                        f"Hệ thống tự động điều chỉnh lùi ngày bắt đầu 7 ngày."
+                    )
+                    start_dt = end_dt - timedelta(days=7)  # Fallback: 7 days before end
+                    st.info(f"✅ Ngày bắt đầu điều chỉnh thành: {start_dt.date()}")
+                
+                # === FETCH DATA ===
                 portfolio_df = get_portfolio_history(manager, start_dt, end_dt)
-                fmp_end      = (end_date_input + timedelta(days=1)).strftime("%Y-%m-%d")
+                
+                if portfolio_df.empty:
+                    st.error("❌ Không thể tải portfolio history. Kiểm tra ngày hoặc kết nối API.")
+                    return
+                
+                # Benchmark: sử dụng cùng date range, không cộng thêm ngày
+                fmp_end = end_date_input.strftime("%Y-%m-%d")
                 benchmark_df = get_benchmark_data(start_dt.date().isoformat(), fmp_end)
 
                 if portfolio_df.empty:
@@ -1009,6 +1034,13 @@ def _show_strategy_execution(account):
 
     def _parse_weights_csv(raw: pd.DataFrame):
         """Convert CSV (wide or long) → DataFrame[gvkey, weight] + latest_date."""
+        # Validate: must have 'date' column
+        if "date" not in raw.columns:
+            raise ValueError(
+                "File weights phải có column 'date'. "
+                "Format: gvkey,weight,date HOẶC wide format với date column"
+            )
+        
         if "gvkey" in raw.columns and "weight" in raw.columns:
             raw["date"] = pd.to_datetime(raw["date"])
             latest = raw["date"].max()
@@ -1027,7 +1059,7 @@ def _show_strategy_execution(account):
 
     # ── 0. Run ML Strategy ────────────────────────────────────────────────────
     with st.expander("🤖 Chạy ML Strategy để tạo weights mới", expanded=False):
-        fund_path = Path("data/fundamentals.csv")
+        fund_path = PROJECT_ROOT / "data" / "fundamentals.csv"
 
         if not fund_path.exists():
             st.warning("`data/fundamentals.csv` chưa tồn tại.")
@@ -1102,7 +1134,7 @@ def _show_strategy_execution(account):
                             if weights_out.empty:
                                 st.error("Mô hình không chọn được cổ phiếu nào. Thử hạ Top Quantile.")
                             else:
-                                out_path = Path("data/ml_weights_today.csv")
+                                out_path = PROJECT_ROOT / "data" / "ml_weights_today.csv"
                                 weights_out.to_csv(out_path, index=False)
                                 st.success(
                                     f"Đã chọn **{len(weights_out)}** cổ phiếu và lưu vào "
@@ -1134,15 +1166,18 @@ def _show_strategy_execution(account):
     latest_date = None
 
     if load_source.startswith("File"):
-        # Scan data/ for candidate CSV files
-        data_dir = Path("data")
+        # Scan data/ for candidate CSV files (use PROJECT_ROOT for absolute path)
+        data_dir = PROJECT_ROOT / "data"
         csv_files = sorted(data_dir.glob("*.csv")) if data_dir.exists() else []
+        # Only accept files with 'weight' or 'ml_' in name
         weight_files = [f for f in csv_files if "weight" in f.name.lower() or "ml_" in f.name.lower()]
-        if not weight_files:
-            weight_files = [f for f in csv_files if f.name != "sp500_tickers.csv"]
 
         if not weight_files:
-            st.warning("Không tìm thấy file weights trong `data/`. Chạy notebook cell 6 trước.")
+            st.warning(
+                "⚠️ Không tìm thấy file weights trong `data/`. \n\n"
+                "**Cần file weights CSV có tên chứa 'weight' hoặc 'ml_' (ví dụ: ml_weights_today.csv)**\n\n"
+                "Chạy notebook cell 6 để generate weights từ ML model."
+            )
         else:
             selected_file = st.selectbox(
                 "Chọn file weights",
