@@ -554,8 +554,8 @@ class MLStockSelectionStrategy(BaseStrategy):
         y = df['y_return'].astype(float)
         dates = df['datadate']
 
-        # Align by dropping rows with NaN in X only (ignore y_return nan check)
-        valid_mask = ~X.isna().any(axis=1)
+        # Drop rows with NaN in X or y
+        valid_mask = ~X.isna().any(axis=1) & y.notna()
 
         X = X.loc[valid_mask]
         y = y.loc[valid_mask]

@@ -180,7 +180,27 @@ class AlpacaManager:
 
         Returns:
             Portfolio history dictionary
+            
+        Raises:
+            ValueError: If date_start is after date_end
         """
+        from datetime import datetime
+        
+        # Validate date range
+        if date_start and date_end:
+            try:
+                start = datetime.strptime(date_start, '%Y-%m-%d')
+                end = datetime.strptime(date_end, '%Y-%m-%d')
+                if start > end:
+                    raise ValueError(
+                        f"date_start ({date_start}) cannot be after date_end ({date_end}). "
+                        f"Please ensure start_date <= end_date."
+                    )
+            except ValueError as e:
+                if "time data" in str(e):
+                    raise ValueError(f"Invalid date format. Use YYYY-MM-DD format. Error: {e}")
+                raise
+        
         account = self._get_account(account_name)
         params = {
             'timeframe': timeframe,
@@ -437,7 +457,7 @@ class AlpacaManager:
             market_value = float(position['market_value'])
             current_weights[symbol] = (market_value / portfolio_value) if portfolio_value > 0 else 0.0
 
-        # FilterÓë¹æ·¶»¯: ½ö±£Áô¿É½»Ò×±êµÄ£»¸ºÈ¨ÖØÊÓÎª0£»±ØÒªÊ±¹éÒ»»¯µ½<=1
+        # Filterï¿½ï¿½æ·¶ï¿½ï¿½: ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½É½ï¿½ï¿½×±ï¿½Ä£ï¿½ï¿½ï¿½È¨ï¿½ï¿½ï¿½ï¿½Îª0ï¿½ï¿½ï¿½ï¿½ÒªÊ±ï¿½ï¿½Ò»ï¿½ï¿½ï¿½ï¿½<=1
         filtered_targets: Dict[str, float] = {}
         raw_targets = target_weights or {}
         for s, w in raw_targets.items():
@@ -457,11 +477,11 @@ class AlpacaManager:
         sum_w = sum(filtered_targets.values())
         used_target_weights: Dict[str, float]
         if sum_w > 1.0001:
-            # ÈôÈ¨ÖØºÍ>1£¬°´×ÜºÍ½øĞĞËõ·Å¹éÒ»»¯
+            # ï¿½ï¿½È¨ï¿½Øºï¿½>1ï¿½ï¿½ï¿½ï¿½ï¿½ÜºÍ½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Å¹ï¿½Ò»ï¿½ï¿½
             used_target_weights = {s: (w / sum_w) for s, w in filtered_targets.items()}
             self.logger.info(f"Target weights sum {sum_w:.6f} > 1; normalized to 1.0 proportionally")
         else:
-            # ºÍ<=1Ôò±£Áô£¬ÔÊĞíÊ£ÓàÏÖ½ğ
+            # ï¿½ï¿½<=1ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ê£ï¿½ï¿½ï¿½Ö½ï¿½
             used_target_weights = dict(filtered_targets)
 
         all_symbols = set(current_weights.keys()) | set(used_target_weights.keys())

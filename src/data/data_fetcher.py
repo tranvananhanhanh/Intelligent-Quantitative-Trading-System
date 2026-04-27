@@ -181,7 +181,10 @@ class FMPFetcher(BaseDataFetcher, DataSource):
             from src.config.settings import get_config
             config = get_config()
             if config.fmp.api_key:
-                return config.fmp.api_key.get_secret_value()
+                api_key = config.fmp.api_key.get_secret_value()
+                # Check if it's a placeholder or invalid key
+                if api_key and api_key.lower() != 'none' and not api_key.startswith('your_'):
+                    return api_key
             return None
         except Exception as e:
             logger.error(f"Failed to get FMP API key: {e}")
@@ -1009,7 +1012,12 @@ class FMPFetcher(BaseDataFetcher, DataSource):
                 
                 # Reset index to get Date as a column
                 df = df.reset_index()
-                
+
+                # Flatten MultiIndex columns produced by newer yfinance versions
+                # e.g. ('Open', 'AAPL') → 'Open'
+                if isinstance(df.columns, pd.MultiIndex):
+                    df.columns = [col[0] for col in df.columns]
+
                 # Standardize column names
                 column_mapping = {
                     'Date': 'datadate',
@@ -1074,6 +1082,237 @@ class FMPFetcher(BaseDataFetcher, DataSource):
         return pd.DataFrame()
 
 
+class YahooFetcher(BaseDataFetcher, DataSource):
+    """Yahoo Finance data fetcher - FREE & NO API KEY REQUIRED."""
+
+    def __init__(self, cache_dir: str = "./data/cache"):
+        super().__init__(cache_dir)
+        self.offline_mode = False  # Yahoo Finance always available
+
+    def is_available(self) -> bool:
+        """Yahoo Finance is always available."""
+        return True
+
+    def get_sp500_components(self, date: str = None) -> pd.DataFrame:
+        """Get S&P 500 components from Wikipedia (yfinance fallback)."""
+        try:
+            logger.info("Fetching S&P 500 components from Wikipedia...")
+            # Try to get from Wikipedia
+            url = 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
+            tables = pd.read_html(url)
+            df = tables[0]
+            
+            # Extract relevant columns
+            if 'Symbol' in df.columns:
+                result = pd.DataFrame({
+                    'tickers': df['Symbol'].str.replace('.', '-'),  # Replace . with - for consistency
+                    'sectors': df.get('GICS Sector', ['Unknown'] * len(df)),
+                    'dateFirstAdded': df.get('Date added', ['Unknown'] * len(df))
+                })
+                logger.info(f"✓ Fetched {len(result)} S&P 500 components from Wikipedia")
+                return result
+            else:
+                logger.warning("Cannot parse S&P 500 from Wikipedia, using sample data")
+                return self._get_sample_sp500()
+        except Exception as e:
+            logger.warning(f"Failed to fetch S&P 500 components: {e}, using sample data")
+            return self._get_sample_sp500()
+
+    def _get_sample_sp500(self) -> pd.DataFrame:
+        """Return sample S&P 500 data as fallback."""
+        sample_tickers = [
+            'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA',
+            'META', 'TSLA', 'JNJ', 'V', 'WMT',
+            'JPM', 'PG', 'MA', 'HD', 'MCD',
+            'BA', 'NKE', 'CSCO', 'ABBV', 'PEP'
+        ]
+        return pd.DataFrame({
+            'tickers': sample_tickers,
+            'sectors': ['Technology'] * 5 + ['Consumer Cyclical'] * 2 + ['Healthcare', 'Financial Services', 'Consumer Defensive'] + 
+                       ['Financial Services', 'Consumer Defensive', 'Financial Services', 'Consumer Cyclical', 'Consumer Cyclical'] +
+                       ['Industrials', 'Consumer Cyclical', 'Technology', 'Healthcare', 'Consumer Defensive'],
+            'dateFirstAdded': ['2000-01-01'] * len(sample_tickers)
+        })
+
+    def get_fundamental_data(self, tickers: pd.DataFrame, start_date: str, end_date: str, 
+                           align_quarter_dates: bool = False) -> pd.DataFrame:
+        """
+        Fetch fundamental data from Yahoo Finance (yfinance).
+        
+        This is the FREE FALLBACK when FMP API is not available.
+        Fetches basic fundamental data + price data for backtesting.
+        Since yfinance doesn't provide quarterly fundamental time series reliably,
+        we use latest fundamental info combined with historical prices.
+        """
+        if isinstance(tickers, list):
+            tickers = pd.DataFrame({
+                'tickers': tickers,
+                'sectors': [None] * len(tickers),
+                'dateFirstAdded': [None] * len(tickers)
+            })
+        
+        tickers_list = tickers['tickers'].tolist() if isinstance(tickers, pd.DataFrame) else list(tickers)
+        
+        logger.info(f"Fetching fundamental data from Yahoo Finance for {len(tickers_list)} tickers...")
+        logger.info("Note: yfinance provides latest fundamentals + historical prices for analysis")
+        
+        all_records = []
+        start_dt = pd.to_datetime(start_date)
+        end_dt = pd.to_datetime(end_date)
+        
+        for ticker in tqdm(tickers_list, desc="Fetching fundamentals"):
+            try:
+                # Fetch ticker info
+                yf_ticker = yf.Ticker(ticker)
+                info = yf_ticker.info
+                
+                # Get latest fundamental info (point-in-time, not time series)
+                sector = info.get('sector', 'Unknown')
+                
+                # Extract latest metrics from info
+                revenue_per_share = info.get('revenuePerShare', np.nan)
+                trailing_pe = info.get('trailingPE', np.nan)
+                trailing_eps = info.get('trailingEps', np.nan)
+                book_value = info.get('bookValue', np.nan)
+                pb = info.get('priceToBook', np.nan)
+                debt_to_equity = info.get('debtToEquity', np.nan)
+                current_price = info.get('currentPrice', np.nan)
+                roe = info.get('returnOnEquity', np.nan)
+                dividend_rate = info.get('dividendRate', np.nan)
+                
+                # Get price history for the date range
+                price_history = pd.DataFrame()
+                try:
+                    price_history = yf_ticker.history(start=start_date, end=end_date)
+                except Exception as ph_err:
+                    logger.debug(f"Could not fetch price history for {ticker}: {ph_err}")
+                
+                if price_history.empty:
+                    logger.debug(f"No price data for {ticker} in range {start_date} to {end_date}")
+                    continue
+                
+                # Create records for EACH DATE in price history
+                # This allows backtesting with available fundamental info
+                # Since yfinance doesn't provide time series fundamentals,
+                # we replicate the same fundamentals across all price dates
+                price_history = price_history.reset_index()
+                
+                if len(price_history) > 0:
+                    # Create a record for EACH trading date with the latest fundamentals
+                    for idx, row in price_history.iterrows():
+                        # Get adj close - handle different column names
+                        adj_close = np.nan
+                        if 'Adj Close' in price_history.columns:
+                            adj_close = float(row['Adj Close']) if pd.notna(row['Adj Close']) else np.nan
+                        elif 'Close' in price_history.columns:
+                            adj_close = float(row['Close']) if pd.notna(row['Close']) else np.nan
+                        
+                        record = {
+                            'gvkey': ticker,
+                            'datadate': row['Date'].strftime('%Y-%m-%d'),  # Each trading date
+                            'tic': ticker,
+                            'gsector': sector,
+                            'adj_close_q': adj_close,
+                            'revenue': revenue_per_share if pd.notna(revenue_per_share) else np.nan,
+                            'net_income': np.nan,  # Not available from yfinance
+                            'total_assets': np.nan,  # Not available from yfinance
+                            'total_liabilities': np.nan,  # Not available from yfinance
+                            'equity': book_value if pd.notna(book_value) else np.nan,
+                            'roe': roe if pd.notna(roe) else np.nan,
+                            'net_income_ratio': np.nan,  # Not available from yfinance
+                            'pe': trailing_pe if pd.notna(trailing_pe) else np.nan,
+                            'pb': pb if pd.notna(pb) else np.nan,
+                            'debt_to_equity': debt_to_equity if pd.notna(debt_to_equity) else np.nan,
+                            'eps': trailing_eps if pd.notna(trailing_eps) else np.nan,
+                            'dps': dividend_rate if pd.notna(dividend_rate) else np.nan,
+                        }
+                        
+                        # Only add if we have at least some fundamental data
+                        if any(pd.notna(v) for v in [revenue_per_share, trailing_pe, book_value, debt_to_equity]):
+                            all_records.append(record)
+                    
+                    logger.debug(f"Added {len(price_history)} fundamental records for {ticker}")
+                        
+            except Exception as e:
+                logger.warning(f"Failed to fetch fundamentals for {ticker} from Yahoo Finance: {e}")
+                continue
+        
+        if all_records:
+            df = pd.DataFrame(all_records)
+            df = df.sort_values(['tic', 'datadate']).reset_index(drop=True)
+            logger.info(f"✓ Fetched {len(df)} fundamental records from Yahoo Finance")
+            return df
+        else:
+            logger.warning("No fundamental data retrieved from Yahoo Finance")
+            return pd.DataFrame()
+
+    def get_price_data(self, tickers: pd.DataFrame, start_date: str, end_date: str) -> pd.DataFrame:
+        """Fetch price data from Yahoo Finance."""
+        if isinstance(tickers, list):
+            tickers = pd.DataFrame({
+                'tickers': tickers,
+                'sectors': [None] * len(tickers),
+                'dateFirstAdded': [None] * len(tickers)
+            })
+        
+        tickers_list = tickers['tickers'].tolist() if isinstance(tickers, pd.DataFrame) else list(tickers)
+        
+        logger.info(f"Fetching price data from Yahoo Finance for {len(tickers_list)} tickers...")
+        
+        all_data = []
+        for ticker in tqdm(tickers_list, desc="Fetching prices"):
+            try:
+                yf_ticker = yf.Ticker(ticker)
+                history = yf_ticker.history(start=start_date, end=end_date)
+                
+                if history.empty:
+                    logger.debug(f"No price data for {ticker}")
+                    continue
+                
+                history = history.reset_index()
+                for _, row in history.iterrows():
+                    # Handle different column names for adjusted close
+                    adj_close = np.nan
+                    if 'Adj Close' in history.columns:
+                        adj_close = float(row['Adj Close']) if pd.notna(row['Adj Close']) else np.nan
+                    elif 'Close' in history.columns:
+                        adj_close = float(row['Close']) if pd.notna(row['Close']) else np.nan
+                    else:
+                        logger.debug(f"No price column found for {ticker}")
+                        continue
+                    
+                    record = {
+                        'gvkey': ticker,
+                        'datadate': row['Date'].strftime('%Y-%m-%d'),
+                        'tic': ticker,
+                        'prccd': float(row['Close']) if pd.notna(row.get('Close')) else np.nan,
+                        'prcod': float(row['Open']) if pd.notna(row.get('Open')) else np.nan,
+                        'prchd': float(row['High']) if pd.notna(row.get('High')) else np.nan,
+                        'prcld': float(row['Low']) if pd.notna(row.get('Low')) else np.nan,
+                        'cshtrd': float(row['Volume']) if pd.notna(row.get('Volume')) else np.nan,
+                        'adj_close': adj_close
+                    }
+                    all_data.append(record)
+            except Exception as e:
+                logger.warning(f"Failed to fetch price data for {ticker}: {e}")
+                continue
+        
+        if all_data:
+            df = pd.DataFrame(all_data)
+            logger.info(f"✓ Fetched {len(df)} price records from Yahoo Finance")
+            return df
+        else:
+            logger.warning("No price data retrieved from Yahoo Finance")
+            return pd.DataFrame()
+
+    def get_news(self, ticker: str, from_date: str, to_date: str,
+                analyze_sentiment: bool = False, sentiment_model: Optional[str] = None,
+                force_refresh: bool = False) -> pd.DataFrame:
+        """Yahoo Finance does not provide news endpoint in yfinance."""
+        logger.warning("News data not available from Yahoo Finance")
+        return pd.DataFrame()
+
+
 class DataSourceManager:
     """Manager for multiple data sources with automatic fallback."""
 
@@ -1090,8 +1329,10 @@ class DataSourceManager:
         self.preferred_source = preferred_source
 
         # Initialize data sources in priority order
+        # Priority: FMP (paid, best quality) → Yahoo Finance (FREE, always available)
         self.data_sources = [
-            ('FMP', FMPFetcher(cache_dir))
+            ('FMP', FMPFetcher(cache_dir)),
+            ('Yahoo', YahooFetcher(cache_dir))  # FREE fallback
         ]
 
         # Determine best available source
@@ -1127,13 +1368,59 @@ class DataSourceManager:
 
     def get_fundamental_data(self, tickers: pd.DataFrame,
                            start_date: str, end_date: str, align_quarter_dates: bool = False) -> pd.DataFrame:
-        """Get fundamental data using best available source."""
-        return self.current_source.get_fundamental_data(tickers, start_date, end_date, align_quarter_dates)
+        """
+        Get fundamental data using best available source.
+        
+        Tries sources in priority order:
+        1. FMP (if API key available)
+        2. Yahoo Finance (FREE fallback)
+        """
+        result = self.current_source.get_fundamental_data(tickers, start_date, end_date, align_quarter_dates)
+        
+        # If current source returns empty, try next fallback source
+        if result is None or result.empty:
+            logger.info(f"No data from {self.current_source_name}, trying fallback sources...")
+            for name, source in self.data_sources:
+                if name != self.current_source_name:
+                    try:
+                        logger.info(f"Trying {name} as fallback...")
+                        result = source.get_fundamental_data(tickers, start_date, end_date, align_quarter_dates)
+                        if result is not None and not result.empty:
+                            logger.info(f"✓ Successfully fetched data from {name}")
+                            return result
+                    except Exception as e:
+                        logger.warning(f"Failed with {name}: {e}, trying next source...")
+                        continue
+        
+        return result if result is not None else pd.DataFrame()
 
     def get_price_data(self, tickers: pd.DataFrame,
                       start_date: str, end_date: str) -> pd.DataFrame:
-        """Get price data using best available source."""
-        return self.current_source.get_price_data(tickers, start_date, end_date)
+        """
+        Get price data using best available source.
+        
+        Tries sources in priority order:
+        1. FMP (if API key available)
+        2. Yahoo Finance (FREE fallback)
+        """
+        result = self.current_source.get_price_data(tickers, start_date, end_date)
+        
+        # If current source returns empty, try next fallback source
+        if result is None or result.empty:
+            logger.info(f"No data from {self.current_source_name}, trying fallback sources...")
+            for name, source in self.data_sources:
+                if name != self.current_source_name:
+                    try:
+                        logger.info(f"Trying {name} as fallback...")
+                        result = source.get_price_data(tickers, start_date, end_date)
+                        if result is not None and not result.empty:
+                            logger.info(f"✓ Successfully fetched data from {name}")
+                            return result
+                    except Exception as e:
+                        logger.warning(f"Failed with {name}: {e}, trying next source...")
+                        continue
+        
+        return result if result is not None else pd.DataFrame()
 
     def get_news(self, ticker: str, from_date: str, to_date: str,
                  analyze_sentiment: bool = False,

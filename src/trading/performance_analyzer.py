@@ -28,52 +28,240 @@ logger = logging.getLogger(__name__)
 TRADING_DAYS_PER_YEAR = 252
 
 def get_first_order_date(manager: AlpacaManager) -> Optional[datetime]:
-    """Get the date of the first order in the account using AlpacaManager."""
+    """Get the date of the first order in the account using AlpacaManager.
+    
+    Returns:
+        - If orders exist: first_order_date - 7 days (ensure Alpaca has "Base Equity" baseline)
+        - If no orders: account_creation_date - 1 day
+        - If error: datetime.now(utc) - 30 days (safe fallback)
+    """
     try:
         orders = manager.get_orders(status='closed', limit=1, direction='asc')
         if orders:
             first_order = orders[0]
-            return datetime.fromisoformat(first_order['submitted_at'].replace('Z', '+00:00'))
+            # Convert to pydatetime for compatibility
+            dt = pd.to_datetime(first_order['submitted_at']).to_pydatetime()
+            # Lùi 7 ngày để đảm bảo Alpaca có dữ liệu "Base Equity" trước khi trade
+            result = dt - timedelta(days=7)
+            logger.info(f"✅ First order found: {dt.date()}, using start_date: {result.date()}")
+            return result
         else:
-            logger.warning("No closed orders found. Using account creation date.")
+            logger.warning("⚠️ No closed orders found. Using account creation date.")
             account_info = manager.get_account_info()
-            creation_date = datetime.fromisoformat(account_info['created_at'].replace('Z', '+00:00'))
-            return creation_date
+            dt = pd.to_datetime(account_info['created_at']).to_pydatetime()
+            # Nếu chưa có lệnh, lấy ngày tạo account lùi 1 ngày
+            result = dt - timedelta(days=1)
+            logger.info(f"✅ Account created: {dt.date()}, using start_date: {result.date()}")
+            return result
     except Exception as e:
-        logger.error(f"Error getting first order date: {e}")
-        return None
+        logger.error(f"❌ Error getting first order date: {e}")
+        # Mặc định 30 ngày nếu có lỗi
+        fallback = datetime.now(timezone.utc) - timedelta(days=30)
+        logger.warning(f"⚠️ Using fallback start_date: {fallback.date()}")
+        return fallback
 
 def get_portfolio_history(manager: AlpacaManager, start_date: datetime, end_date: datetime) -> pd.DataFrame:
-    """Get portfolio history from start_date to end_date using AlpacaManager."""
-    history = manager.get_portfolio_history(
-        timeframe='1D',
-        date_start=start_date.date().isoformat(),
-        date_end=end_date.date().isoformat(),  
-        extended_hours=False
-    )
+    """Get portfolio history from start_date to end_date using AlpacaManager.
+    
+    Handles:
+    - Timezone issues: Converts to UTC and uses .date() to avoid time component confusion
+    - Weekend/Holiday: Automatically adjusts if needed
+    - Invalid date ranges: Ensures start_date < end_date before API call
+    """
+    # Normalize timezone to UTC
+    if start_date.tzinfo is None:
+        start_date = start_date.replace(tzinfo=timezone.utc)
+    if end_date.tzinfo is None:
+        end_date = end_date.replace(tzinfo=timezone.utc)
+    
+    # Convert to date strings (removes time component to avoid Alpaca timezone confusion)
+    s_str = start_date.date().isoformat()
+    e_str = end_date.date().isoformat()
+    
+    # VALIDATION: Ensure start < end (critical for Alpaca API)
+    if s_str > e_str:
+        logger.warning(f"❌ Invalid date range: start_date ({s_str}) > end_date ({e_str}). Adjusting start_date...")
+        start_date = end_date - timedelta(days=7)  # Use 7 days before end
+        s_str = start_date.date().isoformat()
+    elif s_str == e_str:
+        logger.warning(f"⚠️ start_date == end_date ({s_str}). Pushing start back 1 day for Alpaca portfolio history...")
+        start_date = end_date - timedelta(days=1)
+        s_str = start_date.date().isoformat()
+    
+    logger.info(f"📊 Fetching portfolio history from {s_str} to {e_str}")
+    
+    try:
+        history = manager.get_portfolio_history(
+            timeframe='1D',
+            date_start=s_str,
+            date_end=e_str,  
+            extended_hours=False
+        )
+    except Exception as e:
+        logger.error(f"❌ Failed to fetch portfolio history: {e}")
+        if "cannot be after" in str(e).lower():
+            logger.error("   Hint: Check that start_date < end_date and both are valid trading dates")
+        return pd.DataFrame()
+    
+    if not history or 'timestamp' not in history or len(history.get('equity', [])) == 0:
+        logger.warning(f"⚠️ No portfolio history returned for {s_str} to {e_str}")
+        return pd.DataFrame()
+    
     df = pd.DataFrame({
         'date': pd.to_datetime(history['timestamp'], unit='s'),
         'equity': history['equity'],
         'profit_loss': history['profit_loss'],
         'profit_loss_pct': history['profit_loss_pct']
     })
-    print(f"[DEBUG] Portfolio history from {df['date'].min().date()} to {df['date'].max().date()}")
-
+    logger.info(f"✅ Portfolio history retrieved: {len(df)} records from {df['date'].min().date()} to {df['date'].max().date()}")
     return df
+
+def _load_benchmark_from_csv(start_date: str, end_date: str) -> Optional[pd.DataFrame]:
+    """Load benchmark data from local CSV files (SPY_daily.csv, QQQ_daily.csv).
+    
+    Args:
+        start_date: YYYY-MM-DD format
+        end_date: YYYY-MM-DD format
+        
+    Returns:
+        DataFrame with SPY/QQQ data, or None if not found
+    """
+    try:
+        start_dt = pd.to_datetime(start_date)
+        end_dt = pd.to_datetime(end_date)
+        
+        csv_data = {}
+        for ticker in ['SPY', 'QQQ']:
+            csv_path = os.path.join(project_root, 'data', 'fmp_daily', f'{ticker}_daily.csv')
+            
+            if not os.path.exists(csv_path):
+                logger.warning(f"⚠️ CSV not found: {csv_path}")
+                continue
+            
+            try:
+                df = pd.read_csv(csv_path)
+                # Handle different date column names
+                date_col = None
+                for col in ['date', 'datadate', 'Date']:
+                    if col in df.columns:
+                        date_col = col
+                        break
+                
+                if date_col is None:
+                    logger.warning(f"⚠️ No date column found in {csv_path}")
+                    continue
+                
+                df['date'] = pd.to_datetime(df[date_col])
+                df = df.sort_values('date')
+                
+                # Filter by date range
+                df_filtered = df[(df['date'] >= start_dt) & (df['date'] <= end_dt)].copy()
+                
+                if df_filtered.empty:
+                    logger.warning(f"⚠️ CSV {ticker} has no data in range {start_date} to {end_date}")
+                    continue
+                
+                # Use adj_close or close
+                price_col = 'adj_close' if 'adj_close' in df_filtered.columns else 'close'
+                csv_data[ticker] = df_filtered[['date', price_col]].set_index('date')[price_col]
+                logger.info(f"✅ Loaded {ticker} from CSV: {len(csv_data[ticker])} records")
+                
+            except Exception as e:
+                logger.warning(f"⚠️ Error reading {ticker} CSV: {e}")
+                continue
+        
+        if not csv_data:
+            return None
+        
+        # Combine into DataFrame
+        result_df = pd.DataFrame(csv_data)
+        result_df = result_df.dropna(how='all')  # Remove rows where all are NaN
+        
+        logger.info(f"📦 CSV data loaded: {len(result_df)} trading days, columns: {list(result_df.columns)}")
+        return result_df
+        
+    except Exception as e:
+        logger.error(f"❌ Error loading benchmark from CSV: {e}")
+        return None
+
 
 def get_benchmark_data(start_date: str, end_date: str) -> pd.DataFrame:
-    """Get historical price data for SPY and QQQ."""
-    #print(f"[DEBUG] Benchmark data from {start_date} to {end_date}")
-    print(f"***************start_date is {start_date}******************")
-    print(f"***************end_date is {end_date}******************")
-    df = fetch_price_data(['SPY', 'QQQ'], start_date, end_date)
-    df['date'] = pd.to_datetime(df['datadate'])
-    df = df.pivot(index='date', columns='tic', values='adj_close')
-    # 保留原有列名并明确列顺序，避免因列顺序变化导致 SPY/QQQ 对调
-    df = df[[c for c in ['SPY', 'QQQ'] if c in df.columns]]
-    print(df.tail(10))   
-
-    return df
+    """Get historical price data for SPY and QQQ - HYBRID (CSV + YFinance direct)."""
+    from datetime import datetime as dt_cls
+    import pandas as pd
+    from datetime import timedelta
+    import yfinance as yf # Sử dụng trực tiếp yfinance cho benchmark
+    
+    # Validate date format and range
+    try:
+        s = dt_cls.strptime(start_date, '%Y-%m-%d')
+        e = dt_cls.strptime(end_date, '%Y-%m-%d')
+        if s >= e:
+            logger.warning(f"⚠️ Benchmark: start_date ({start_date}) >= end_date ({end_date}). Adjusting...")
+            s = e - timedelta(days=7)
+            start_date = s.strftime('%Y-%m-%d')
+    except ValueError as ve:
+        logger.error(f"❌ Invalid date format. Expected YYYY-MM-DD. Error: {ve}")
+        return pd.DataFrame()
+    
+    logger.info(f"📈 Fetching benchmark data (SPY/QQQ) HYBRID mode: {start_date} to {end_date}")
+    
+    # ==================== STEP 1: Try CSV ====================
+    csv_df = _load_benchmark_from_csv(start_date, end_date)
+    
+    if csv_df is not None and not csv_df.empty:
+        csv_max_date = csv_df.index.max()
+        requested_end = pd.to_datetime(end_date)
+        
+        # ✅ CSV has all data we need
+        if csv_max_date >= requested_end:
+            logger.info(f"✅ Using CSV data (covers full range)")
+            return csv_df.dropna(how='all')
+        
+        # ⚠️ CSV is partial - fetch remaining from API
+        api_start = (csv_max_date + timedelta(days=1)).strftime('%Y-%m-%d')
+    else:
+        logger.info("ℹ️ CSV data not available, trying API...")
+        api_start = start_date
+    
+    # ==================== STEP 2: Bulletproof YFinance API ====================
+    try:
+        logger.info(f"Fetching realtime benchmark from Yahoo Finance: {api_start} to {end_date}")
+        
+        # yfinance bỏ qua ngày cuối (exclusive end_date), nên cần +1 ngày
+        end_date_yf = (dt_cls.strptime(end_date, '%Y-%m-%d') + timedelta(days=1)).strftime('%Y-%m-%d')
+        
+        api_df = yf.download(['SPY', 'QQQ'], start=api_start, end=end_date_yf, progress=False)
+        
+        if api_df is not None and not api_df.empty:
+            # Xử lý an toàn cấu trúc MultiIndex của yfinance
+            if 'Adj Close' in api_df:
+                api_df = api_df['Adj Close']
+            elif 'Close' in api_df:
+                api_df = api_df['Close']
+                
+            # Chuẩn hóa index về datetime không có timezone để dễ merge
+            api_df.index = pd.to_datetime(api_df.index).normalize()
+            
+            logger.info(f"✅ API data loaded successfully")
+            
+            # Combine CSV + API
+            if csv_df is not None and not csv_df.empty:
+                combined = pd.concat([csv_df, api_df])
+                combined = combined[~combined.index.duplicated(keep='last')]
+                combined = combined.sort_index()
+                return combined.dropna(how='all')
+            else:
+                return api_df.dropna(how='all')
+        else:
+            logger.warning("⚠️ YFinance returned empty data.")
+            return csv_df.dropna(how='all') if csv_df is not None else pd.DataFrame()
+            
+    except Exception as e:
+        logger.error(f"❌ YFinance fetch failed: {e}")
+        if csv_df is not None and not csv_df.empty:
+            return csv_df.dropna(how='all')
+        return pd.DataFrame()
 
 def calculate_returns(df: pd.DataFrame, column: str) -> float:
     """Calculate total return percentage."""
@@ -92,13 +280,15 @@ def _compute_daily_returns(series: pd.Series) -> pd.Series:
 
 def compute_performance_metrics(series: pd.Series, risk_free_rate: float = 0.02) -> Dict[str, float]:
     """Compute key performance metrics for a price/equity series.
-
-    Returns metrics as percentages for return/volatility/drawdown and raw value for Sharpe.
-    - total_return: %
-    - annual_return: % (geometric, annualized from daily returns)
-    - annual_volatility: % (std of daily returns * sqrt(252))
+    
+    Safely handles short time periods and edge cases (inf, nan, zero division).
+    
+    Returns metrics as percentages for return/volatility/drawdown.
+    - total_return: % (actual total return over period)
+    - annual_return: % (annualized, or total return if period < 10 days)
+    - annual_volatility: % (annualized volatility, 0 if insufficient data)
     - sharpe_ratio: (annual_return - rf) / annual_volatility
-    - max_drawdown: % (min drawdown)
+    - max_drawdown: % (maximum drawdown)
     """
     result = {
         'total_return': 0.0,
@@ -107,42 +297,62 @@ def compute_performance_metrics(series: pd.Series, risk_free_rate: float = 0.02)
         'sharpe_ratio': 0.0,
         'max_drawdown': 0.0,
     }
+    
     if series is None or len(series) < 2:
         return result
-
+    
+    # Remove NaN and zero values to avoid division by zero
     s = pd.Series(series).astype(float)
-    s = s.dropna()
+    s = s.replace(0, np.nan).dropna()
+    
     if len(s) < 2:
         return result
-
-    # Total return
-    total_return = (s.iloc[-1] / s.iloc[0] - 1.0) * 100.0
-
-    # Daily returns
-    daily_returns = s.pct_change().dropna()
-    n = len(daily_returns)
-    if n == 0:
-        result['total_return'] = float(total_return)
+    
+    # 1. Total Return (Lợi nhuận tổng)
+    start_price = s.iloc[0]
+    end_price = s.iloc[-1]
+    
+    if start_price <= 0:
+        logger.warning(f"⚠️ Warning: Invalid start price {start_price}. Cannot calculate returns.")
         return result
-
-    # Annualized return (geometric)
-    compounded = (1.0 + daily_returns).prod()
-    annual_return = (compounded ** (TRADING_DAYS_PER_YEAR / n) - 1.0) * 100.0
-
-    # Annualized volatility
-    annual_volatility = daily_returns.std(ddof=0) * np.sqrt(TRADING_DAYS_PER_YEAR) * 100.0
-
-    # Sharpe ratio (use annualized values; rf is annual decimal)
-    eps = 1e-12
+    
+    total_return = ((end_price / start_price) - 1.0) * 100.0
+    
+    # 2. Daily Returns
+    daily_returns = s.pct_change().dropna()
+    n_days = len(daily_returns)
+    
+    if n_days == 0:
+        result['total_return'] = float(total_return)
+        logger.warning(f"⚠️ Insufficient daily returns data (n={n_days})")
+        return result
+    
+    # 3. Annualization: Only if we have >10 trading days, otherwise use total return
+    # This prevents huge amplification of short-term volatility
+    if n_days > 10:
+        # Geometric compounding: (1 + r1) * (1 + r2) * ... * (1 + rn)
+        compounded = (1.0 + daily_returns).prod()
+        # Annualize: ((1 + compounded) ^ (252 / n)) - 1
+        annual_return = ((compounded) ** (TRADING_DAYS_PER_YEAR / n_days) - 1.0) * 100.0
+        annual_volatility = daily_returns.std() * np.sqrt(TRADING_DAYS_PER_YEAR) * 100.0
+        logger.info(f"✅ Sufficient data: {n_days} days. Using annualized metrics.")
+    else:
+        # Short period: use total return as annual return to avoid distortion
+        annual_return = total_return
+        annual_volatility = daily_returns.std() * np.sqrt(TRADING_DAYS_PER_YEAR) * 100.0 if n_days > 1 else 0.0
+        logger.warning(f"⚠️ Short period: {n_days} days only. Using total return as annual estimate. "
+                      f"Annualized metrics may be unreliable.")
+    
+    # 4. Sharpe Ratio (only if volatility > 0)
     sharpe_ratio = 0.0
-    if annual_volatility > eps:
+    if annual_volatility > 1e-12:
         sharpe_ratio = ((annual_return / 100.0) - float(risk_free_rate)) / (annual_volatility / 100.0)
-
-    # Max drawdown
+    
+    # 5. Max Drawdown
     rolling_max = s.cummax()
-    drawdown = s / rolling_max - 1.0
-    max_drawdown = float(drawdown.min()) * 100.0
-
+    drawdown = (s - rolling_max) / rolling_max * 100.0
+    max_drawdown = float(drawdown.min())
+    
     result.update({
         'total_return': float(total_return),
         'annual_return': float(annual_return),
@@ -150,6 +360,11 @@ def compute_performance_metrics(series: pd.Series, risk_free_rate: float = 0.02)
         'sharpe_ratio': float(sharpe_ratio),
         'max_drawdown': float(max_drawdown),
     })
+    
+    # Log summary
+    logger.info(f"📊 Performance Metrics: Total={total_return:.2f}%, Annual={annual_return:.2f}%, "
+               f"Vol={annual_volatility:.2f}%, Sharpe={sharpe_ratio:.2f}, MaxDD={max_drawdown:.2f}%")
+    
     return result
 
 def display_metrics_table(portfolio_df: pd.DataFrame, benchmark_df: pd.DataFrame, risk_free_rate: Optional[float] = None):
