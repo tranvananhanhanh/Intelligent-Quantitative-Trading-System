@@ -875,14 +875,14 @@ def _show_performance_monitoring(account):
                 benchmark_df = get_benchmark_data(start_dt.date().isoformat(), fmp_end)
                 
                 # Debug: Show benchmark data status
-                if benchmark_df.empty:
-                    st.warning("⚠️ Benchmark data (SPY/QQQ) không có dữ liệu - Chart sẽ chỉ show Portfolio")
-                else:
-                    st.success(f"✅ Benchmark loaded: {list(benchmark_df.columns)}, {len(benchmark_df)} dates")
+                #if benchmark_df.empty:
+                 #   st.warning("⚠️ Benchmark data (SPY/QQQ) không có dữ liệu - Chart sẽ chỉ show Portfolio")
+                #else:
+                 #   st.success(f"✅ Benchmark loaded: {list(benchmark_df.columns)}, {len(benchmark_df)} dates")
 
-                if portfolio_df.empty:
-                    st.warning("Không có dữ liệu portfolio history trong khoảng thời gian này.")
-                    return
+                #if portfolio_df.empty:
+                 #   st.warning("Không có dữ liệu portfolio history trong khoảng thời gian này.")
+                  #  return
 
                 # ── Metrics ───────────────────────────────────────────────────
                 st.markdown("#### Chỉ số hiệu suất")

@@ -186,21 +186,11 @@ def _load_benchmark_from_csv(start_date: str, end_date: str) -> Optional[pd.Data
 
 
 def get_benchmark_data(start_date: str, end_date: str) -> pd.DataFrame:
-    """Get historical price data for SPY and QQQ - HYBRID (CSV + API).
-    
-    Strategy:
-    1. Try to load from local CSV files first (fast, offline)
-    2. If CSV doesn't cover full range, fetch missing data from API (realtime)
-    3. Combine both sources
-    
-    Args:
-        start_date: YYYY-MM-DD format
-        end_date: YYYY-MM-DD format
-        
-    Returns:
-        DataFrame with SPY/QQQ adjusted close prices indexed by date
-    """
+    """Get historical price data for SPY and QQQ - HYBRID (CSV + YFinance direct)."""
     from datetime import datetime as dt_cls
+    import pandas as pd
+    from datetime import timedelta
+    import yfinance as yf # Sử dụng trực tiếp yfinance cho benchmark
     
     # Validate date format and range
     try:
@@ -225,68 +215,53 @@ def get_benchmark_data(start_date: str, end_date: str) -> pd.DataFrame:
         
         # ✅ CSV has all data we need
         if csv_max_date >= requested_end:
-            logger.info(f"✅ Using CSV data (covers full range: {csv_df.index.min().date()} to {csv_df.index.max().date()})")
+            logger.info(f"✅ Using CSV data (covers full range)")
             return csv_df.dropna(how='all')
         
         # ⚠️ CSV is partial - fetch remaining from API
-        logger.info(f"📌 CSV covers {csv_df.index.min().date()} to {csv_max_date.date()}, fetching API for {csv_max_date.date()} to {end_date}...")
         api_start = (csv_max_date + timedelta(days=1)).strftime('%Y-%m-%d')
     else:
         logger.info("ℹ️ CSV data not available, trying API...")
         api_start = start_date
     
-    # ==================== STEP 2: Try API ====================
+    # ==================== STEP 2: Bulletproof YFinance API ====================
     try:
-        api_df = fetch_price_data(['SPY', 'QQQ'], api_start, end_date)
+        logger.info(f"Fetching realtime benchmark from Yahoo Finance: {api_start} to {end_date}")
         
-        if api_df is None or api_df.empty:
-            logger.warning(f"⚠️ API returned no data for {api_start} to {end_date}")
+        # yfinance bỏ qua ngày cuối (exclusive end_date), nên cần +1 ngày
+        end_date_yf = (dt_cls.strptime(end_date, '%Y-%m-%d') + timedelta(days=1)).strftime('%Y-%m-%d')
+        
+        api_df = yf.download(['SPY', 'QQQ'], start=api_start, end=end_date_yf, progress=False)
+        
+        if api_df is not None and not api_df.empty:
+            # Xử lý an toàn cấu trúc MultiIndex của yfinance
+            if 'Adj Close' in api_df:
+                api_df = api_df['Adj Close']
+            elif 'Close' in api_df:
+                api_df = api_df['Close']
+                
+            # Chuẩn hóa index về datetime không có timezone để dễ merge
+            api_df.index = pd.to_datetime(api_df.index).normalize()
             
-            if csv_df is not None and not csv_df.empty:
-                logger.info("✅ Returning partial CSV data")
-                return csv_df.dropna(how='all')
-            else:
-                logger.error("❌ No benchmark data from CSV or API")
-                return pd.DataFrame()
-        
-        # Process API data
-        if 'tic' not in api_df.columns or 'datadate' not in api_df.columns:
-            logger.warning(f"⚠️ API data missing expected columns. Available: {list(api_df.columns)}")
-            if csv_df is not None and not csv_df.empty:
-                return csv_df.dropna(how='all')
-            return pd.DataFrame()
-        
-        api_df['date'] = pd.to_datetime(api_df['datadate'])
-        api_df = api_df.pivot(index='date', columns='tic', values='adj_close')
-        present_cols = [c for c in ['SPY', 'QQQ'] if c in api_df.columns]
-        
-        if present_cols:
-            api_df = api_df[present_cols]
-            logger.info(f"✅ API data loaded: {len(api_df)} records, columns: {list(api_df.columns)}")
+            logger.info(f"✅ API data loaded successfully")
             
             # Combine CSV + API
             if csv_df is not None and not csv_df.empty:
                 combined = pd.concat([csv_df, api_df])
-                combined = combined[~combined.index.duplicated(keep='last')]  # Remove duplicates, keep latest
+                combined = combined[~combined.index.duplicated(keep='last')]
                 combined = combined.sort_index()
-                logger.info(f"✅ Hybrid data (CSV+API): {len(combined)} total records, {list(combined.columns)}")
                 return combined.dropna(how='all')
             else:
                 return api_df.dropna(how='all')
         else:
-            logger.warning("⚠️ API data has no SPY/QQQ columns")
-            if csv_df is not None and not csv_df.empty:
-                return csv_df.dropna(how='all')
-            return pd.DataFrame()
-        
+            logger.warning("⚠️ YFinance returned empty data.")
+            return csv_df.dropna(how='all') if csv_df is not None else pd.DataFrame()
+            
     except Exception as e:
-        logger.error(f"❌ API fetch failed: {e}")
-        
+        logger.error(f"❌ YFinance fetch failed: {e}")
         if csv_df is not None and not csv_df.empty:
-            logger.info("✅ Falling back to CSV data")
             return csv_df.dropna(how='all')
-        else:
-            return pd.DataFrame()
+        return pd.DataFrame()
 
 def calculate_returns(df: pd.DataFrame, column: str) -> float:
     """Calculate total return percentage."""
