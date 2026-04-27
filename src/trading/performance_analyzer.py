@@ -116,12 +116,89 @@ def get_portfolio_history(manager: AlpacaManager, start_date: datetime, end_date
     logger.info(f"✅ Portfolio history retrieved: {len(df)} records from {df['date'].min().date()} to {df['date'].max().date()}")
     return df
 
-def get_benchmark_data(start_date: str, end_date: str) -> pd.DataFrame:
-    """Get historical price data for SPY and QQQ.
+def _load_benchmark_from_csv(start_date: str, end_date: str) -> Optional[pd.DataFrame]:
+    """Load benchmark data from local CSV files (SPY_daily.csv, QQQ_daily.csv).
     
     Args:
         start_date: YYYY-MM-DD format
         end_date: YYYY-MM-DD format
+        
+    Returns:
+        DataFrame with SPY/QQQ data, or None if not found
+    """
+    try:
+        start_dt = pd.to_datetime(start_date)
+        end_dt = pd.to_datetime(end_date)
+        
+        csv_data = {}
+        for ticker in ['SPY', 'QQQ']:
+            csv_path = os.path.join(project_root, 'data', 'fmp_daily', f'{ticker}_daily.csv')
+            
+            if not os.path.exists(csv_path):
+                logger.warning(f"⚠️ CSV not found: {csv_path}")
+                continue
+            
+            try:
+                df = pd.read_csv(csv_path)
+                # Handle different date column names
+                date_col = None
+                for col in ['date', 'datadate', 'Date']:
+                    if col in df.columns:
+                        date_col = col
+                        break
+                
+                if date_col is None:
+                    logger.warning(f"⚠️ No date column found in {csv_path}")
+                    continue
+                
+                df['date'] = pd.to_datetime(df[date_col])
+                df = df.sort_values('date')
+                
+                # Filter by date range
+                df_filtered = df[(df['date'] >= start_dt) & (df['date'] <= end_dt)].copy()
+                
+                if df_filtered.empty:
+                    logger.warning(f"⚠️ CSV {ticker} has no data in range {start_date} to {end_date}")
+                    continue
+                
+                # Use adj_close or close
+                price_col = 'adj_close' if 'adj_close' in df_filtered.columns else 'close'
+                csv_data[ticker] = df_filtered[['date', price_col]].set_index('date')[price_col]
+                logger.info(f"✅ Loaded {ticker} from CSV: {len(csv_data[ticker])} records")
+                
+            except Exception as e:
+                logger.warning(f"⚠️ Error reading {ticker} CSV: {e}")
+                continue
+        
+        if not csv_data:
+            return None
+        
+        # Combine into DataFrame
+        result_df = pd.DataFrame(csv_data)
+        result_df = result_df.dropna(how='all')  # Remove rows where all are NaN
+        
+        logger.info(f"📦 CSV data loaded: {len(result_df)} trading days, columns: {list(result_df.columns)}")
+        return result_df
+        
+    except Exception as e:
+        logger.error(f"❌ Error loading benchmark from CSV: {e}")
+        return None
+
+
+def get_benchmark_data(start_date: str, end_date: str) -> pd.DataFrame:
+    """Get historical price data for SPY and QQQ - HYBRID (CSV + API).
+    
+    Strategy:
+    1. Try to load from local CSV files first (fast, offline)
+    2. If CSV doesn't cover full range, fetch missing data from API (realtime)
+    3. Combine both sources
+    
+    Args:
+        start_date: YYYY-MM-DD format
+        end_date: YYYY-MM-DD format
+        
+    Returns:
+        DataFrame with SPY/QQQ adjusted close prices indexed by date
     """
     from datetime import datetime as dt_cls
     
@@ -137,30 +214,79 @@ def get_benchmark_data(start_date: str, end_date: str) -> pd.DataFrame:
         logger.error(f"❌ Invalid date format. Expected YYYY-MM-DD. Error: {ve}")
         return pd.DataFrame()
     
-    logger.info(f"📈 Fetching benchmark data (SPY/QQQ) from {start_date} to {end_date}")
+    logger.info(f"📈 Fetching benchmark data (SPY/QQQ) HYBRID mode: {start_date} to {end_date}")
     
+    # ==================== STEP 1: Try CSV ====================
+    csv_df = _load_benchmark_from_csv(start_date, end_date)
+    
+    if csv_df is not None and not csv_df.empty:
+        csv_max_date = csv_df.index.max()
+        requested_end = pd.to_datetime(end_date)
+        
+        # ✅ CSV has all data we need
+        if csv_max_date >= requested_end:
+            logger.info(f"✅ Using CSV data (covers full range: {csv_df.index.min().date()} to {csv_df.index.max().date()})")
+            return csv_df.dropna(how='all')
+        
+        # ⚠️ CSV is partial - fetch remaining from API
+        logger.info(f"📌 CSV covers {csv_df.index.min().date()} to {csv_max_date.date()}, fetching API for {csv_max_date.date()} to {end_date}...")
+        api_start = (csv_max_date + timedelta(days=1)).strftime('%Y-%m-%d')
+    else:
+        logger.info("ℹ️ CSV data not available, trying API...")
+        api_start = start_date
+    
+    # ==================== STEP 2: Try API ====================
     try:
-        df = fetch_price_data(['SPY', 'QQQ'], start_date, end_date)
+        api_df = fetch_price_data(['SPY', 'QQQ'], api_start, end_date)
         
-        if df.empty:
-            logger.warning(f"⚠️ No benchmark data returned for {start_date} to {end_date}")
+        if api_df is None or api_df.empty:
+            logger.warning(f"⚠️ API returned no data for {api_start} to {end_date}")
+            
+            if csv_df is not None and not csv_df.empty:
+                logger.info("✅ Returning partial CSV data")
+                return csv_df.dropna(how='all')
+            else:
+                logger.error("❌ No benchmark data from CSV or API")
+                return pd.DataFrame()
+        
+        # Process API data
+        if 'tic' not in api_df.columns or 'datadate' not in api_df.columns:
+            logger.warning(f"⚠️ API data missing expected columns. Available: {list(api_df.columns)}")
+            if csv_df is not None and not csv_df.empty:
+                return csv_df.dropna(how='all')
             return pd.DataFrame()
         
-        df['date'] = pd.to_datetime(df['datadate'])
-        df = df.pivot(index='date', columns='tic', values='adj_close')
-        # 保留原有列名并明确列顺序，避免因列顺序变化导致 SPY/QQQ 对调
-        present_cols = [c for c in ['SPY', 'QQQ'] if c in df.columns]
-        if not present_cols:
-            logger.warning("⚠️ Neither SPY nor QQQ data found")
-            return pd.DataFrame()
+        api_df['date'] = pd.to_datetime(api_df['datadate'])
+        api_df = api_df.pivot(index='date', columns='tic', values='adj_close')
+        present_cols = [c for c in ['SPY', 'QQQ'] if c in api_df.columns]
         
-        df = df[present_cols]
-        logger.info(f"✅ Benchmark data retrieved: {len(df)} records, columns: {list(df.columns)}")
-        return df
+        if present_cols:
+            api_df = api_df[present_cols]
+            logger.info(f"✅ API data loaded: {len(api_df)} records, columns: {list(api_df.columns)}")
+            
+            # Combine CSV + API
+            if csv_df is not None and not csv_df.empty:
+                combined = pd.concat([csv_df, api_df])
+                combined = combined[~combined.index.duplicated(keep='last')]  # Remove duplicates, keep latest
+                combined = combined.sort_index()
+                logger.info(f"✅ Hybrid data (CSV+API): {len(combined)} total records, {list(combined.columns)}")
+                return combined.dropna(how='all')
+            else:
+                return api_df.dropna(how='all')
+        else:
+            logger.warning("⚠️ API data has no SPY/QQQ columns")
+            if csv_df is not None and not csv_df.empty:
+                return csv_df.dropna(how='all')
+            return pd.DataFrame()
         
     except Exception as e:
-        logger.error(f"❌ Failed to fetch benchmark data: {e}")
-        return pd.DataFrame()
+        logger.error(f"❌ API fetch failed: {e}")
+        
+        if csv_df is not None and not csv_df.empty:
+            logger.info("✅ Falling back to CSV data")
+            return csv_df.dropna(how='all')
+        else:
+            return pd.DataFrame()
 
 def calculate_returns(df: pd.DataFrame, column: str) -> float:
     """Calculate total return percentage."""

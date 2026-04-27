@@ -26,7 +26,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 DATA_DIR = PROJECT_ROOT / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
-
 # Import project modules with individual try-except
 from config.settings import get_config
 
@@ -245,9 +244,6 @@ def show_data_management():
                 with st.spinner("Fetching fundamental data..."):
                     try:
                         from data.data_fetcher import fetch_fundamental_data
-                        from data.data_quality import DataQualityChecker
-                        from pathlib import Path
-                        
                         tickers = ['AAPL', 'MSFT', 'GOOGL']
                         fundamentals = fetch_fundamental_data(
                             tickers, '2020-01-01', '2023-12-31'
@@ -260,7 +256,7 @@ def show_data_management():
                             
                             st.success(f"✓ Successfully fetched {len(fundamentals)} records")
                             st.info(f"💾 Saved to `{csv_path}`")
-                            st.dataframe(fundamentals.head(10), use_container_width='stretch')
+                            st.dataframe(fundamentals.head(10), use_container_width=True)
                             
                             # Store in session state for later use
                             st.session_state['fundamentals_data'] = fundamentals
@@ -483,7 +479,7 @@ def show_data_management():
         fund_exists = fund_path.exists()
         prices_exists = prices_path.exists()
 
-        if st.button("🔍 Assess Data Quality", use_container_width='stretch'):
+        if st.button("🔍 Assess Data Quality", use_container_width=True):
             if not fund_exists and not prices_exists:
                 st.error("❌ No data files found!")
                 st.info("📌 Please fetch and process data first in the **Data Sources** and **Data Processing** tabs")
@@ -535,7 +531,7 @@ def show_data_management():
                                     checker.score_to_status(fund_scores['timeliness'])[0]
                                 ]
                             })
-                            st.dataframe(breakdown_df, use_container_width='stretch')
+                            st.dataframe(breakdown_df, use_container_width=True)
                             st.caption(f"📦 Records: {fund_scores.get('record_count', 'N/A')}")
                     
                     # ===== PRICE DATA QUALITY =====
@@ -570,7 +566,7 @@ def show_data_management():
                                     checker.score_to_status(price_scores['timeliness'])[0]
                                 ]
                             })
-                            st.dataframe(breakdown_df, use_container_width='stretch')
+                            st.dataframe(breakdown_df, use_container_width=True)
                             st.caption(f"📦 Records: {price_scores.get('record_count', 'N/A')}")
                     
                     # ===== RECOMMENDATIONS =====
@@ -654,9 +650,9 @@ def show_strategy_backtesting():
                 final_val = result.portfolio_values.iloc[-1] if hasattr(result, 'portfolio_values') and len(result.portfolio_values) > 0 else result.metrics.get('final_value', 0)
                 st.metric("Final Value", f"${float(final_val):,.2f}")
             with metrics_cols[1]:
-                st.metric("Total Return", f"{result.metrics.get('total_return', 0):.2%}")
+                st.metric("Total Return", f"{result.metrics.get('total_return', 0):.2f}%")
             with metrics_cols[2]:
-                st.metric("Annual Return", f"{result.annualized_return:.2%}")
+                st.metric("Annual Return", f"{result.annualized_return:.2f}%")
             with metrics_cols[3]:
                 st.metric("Sharpe Ratio", f"{result.metrics.get('sharpe_ratio', 0):.2f}")
 
@@ -877,6 +873,12 @@ def _show_performance_monitoring(account):
                 # Benchmark: sử dụng cùng date range, không cộng thêm ngày
                 fmp_end = end_date_input.strftime("%Y-%m-%d")
                 benchmark_df = get_benchmark_data(start_dt.date().isoformat(), fmp_end)
+                
+                # Debug: Show benchmark data status
+                if benchmark_df.empty:
+                    st.warning("⚠️ Benchmark data (SPY/QQQ) không có dữ liệu - Chart sẽ chỉ show Portfolio")
+                else:
+                    st.success(f"✅ Benchmark loaded: {list(benchmark_df.columns)}, {len(benchmark_df)} dates")
 
                 if portfolio_df.empty:
                     st.warning("Không có dữ liệu portfolio history trong khoảng thời gian này.")
@@ -888,39 +890,32 @@ def _show_performance_monitoring(account):
                 pm = compute_performance_metrics(equity_series)
 
                 cols_m = st.columns(5)
-                cols_m[0].metric("Total Return",      f"{pm['total_return']:.2%}")
-                cols_m[1].metric("Annual Return",     f"{pm['annual_return']:.2%}")
-                cols_m[2].metric("Volatility (Ann.)", f"{pm['annual_volatility']:.2%}")
+                cols_m[0].metric("Total Return",      f"{pm['total_return']:.2f}%")
+                cols_m[1].metric("Annual Return",     f"{pm['annual_return']:.2f}%")
+                cols_m[2].metric("Volatility (Ann.)", f"{pm['annual_volatility']:.2f}%")
                 cols_m[3].metric("Sharpe Ratio",      f"{pm['sharpe_ratio']:.2f}")
-                cols_m[4].metric("Max Drawdown",      f"{pm['max_drawdown']:.2%}")
+                cols_m[4].metric("Max Drawdown",      f"{pm['max_drawdown']:.2f}%")
 
-                # Benchmark metrics
+                # Benchmark metrics - hiển thị riêng từng dòng
                 if not benchmark_df.empty:
-                    bm_cols = st.columns(len(benchmark_df.columns))
-                    for i, bm in enumerate(benchmark_df.columns):
+                    st.markdown("**Benchmark Performance:**")
+                    for bm in benchmark_df.columns:
                         bm_series = benchmark_df[bm].dropna()
                         if len(bm_series) > 1:
                             bm_m = compute_performance_metrics(bm_series)
-                            with bm_cols[i]:
-                                st.markdown(f"**{bm}**: Return {bm_m['total_return']:.2%} | "
-                                            f"Sharpe {bm_m['sharpe_ratio']:.2f} | "
-                                            f"MaxDD {bm_m['max_drawdown']:.2%}")
+                            st.markdown(f"• **{bm}**: Return {bm_m['total_return']:.2f}% | "
+                                        f"Sharpe {bm_m['sharpe_ratio']:.2f} | "
+                                        f"MaxDD {bm_m['max_drawdown']:.2f}%")
 
                 st.divider()
 
                 # ── Equity curve vs benchmarks ────────────────────────────────
                 st.markdown("#### Equity Curve so với Benchmark")
                 fig = go.Figure()
+                
+                traces_added = 0
 
-                # Normalize to 1.0
-                eq = equity_series.dropna()
-                if len(eq) > 0:
-                    eq_norm = eq / eq.iloc[0]
-                    fig.add_trace(go.Scatter(
-                        x=eq_norm.index, y=eq_norm.values,
-                        name="Portfolio", line=dict(width=2, color="#2962FF")
-                    ))
-
+                # === Add Benchmarks FIRST (so Portfolio is on top) ===
                 colors = {"SPY": "#FF6D00", "QQQ": "#00BFA5"}
                 if not benchmark_df.empty:
                     for bm in benchmark_df.columns:
@@ -929,16 +924,40 @@ def _show_performance_monitoring(account):
                             bm_norm = bm_s / bm_s.iloc[0]
                             fig.add_trace(go.Scatter(
                                 x=bm_norm.index, y=bm_norm.values,
-                                name=bm, line=dict(dash="dash", color=colors.get(bm, "gray"))
+                                name=bm, line=dict(dash="dash", width=1.5, color=colors.get(bm, "gray"))
                             ))
+                            traces_added += 1
+
+                # === Add Portfolio LAST (so it's on top, more visible) ===
+                eq = equity_series.dropna()
+                
+                if len(eq) > 0:
+                    # FIX: Find first non-zero value to avoid division by zero → inf
+                    first_nonzero_idx = (eq != 0).idxmax() if (eq != 0).any() else None
+                    
+                    if first_nonzero_idx is not None and eq[first_nonzero_idx] != 0:
+                        eq_clean = eq[first_nonzero_idx:]  # Start from first non-zero
+                        eq_norm = eq_clean / eq_clean.iloc[0]
+                        
+                        if not np.isinf(eq_norm.values).any():  # Check no infinity values
+                            fig.add_trace(go.Scatter(
+                                x=eq_norm.index, y=eq_norm.values,
+                                name="Portfolio", line=dict(width=1.5, color="#1A237E"),
+                                hovertemplate="<b>Portfolio</b><br>Date: %{x|%Y-%m-%d}<br>Return: %{y:.4f}<extra></extra>"
+                            ))
+                            traces_added += 1
 
                 fig.update_layout(
                     title="Normalized Performance (Base = 1.0)",
                     xaxis_title="Date", yaxis_title="Return",
                     hovermode="x unified", height=400,
-                    legend=dict(orientation="h", yanchor="bottom", y=1.02)
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0)
                 )
-                st.plotly_chart(fig, use_container_width='stretch')
+                
+                if traces_added == 0:
+                    st.warning("❌ Không có dữ liệu để hiển thị chart (equity hoặc benchmark trống)")
+                else:
+                    st.plotly_chart(fig, use_container_width='stretch')
 
                 # ── Daily P&L chart ───────────────────────────────────────────
                 st.markdown("#### P&L hàng ngày")
