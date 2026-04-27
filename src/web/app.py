@@ -260,7 +260,7 @@ def show_data_management():
                             
                             st.success(f"✓ Successfully fetched {len(fundamentals)} records")
                             st.info(f"💾 Saved to `{csv_path}`")
-                            st.dataframe(fundamentals.head(10), use_container_width=True)
+                            st.dataframe(fundamentals.head(10), use_container_width='stretch')
                             
                             # Store in session state for later use
                             st.session_state['fundamentals_data'] = fundamentals
@@ -483,7 +483,7 @@ def show_data_management():
         fund_exists = fund_path.exists()
         prices_exists = prices_path.exists()
 
-        if st.button("🔍 Assess Data Quality", use_container_width=True):
+        if st.button("🔍 Assess Data Quality", use_container_width='stretch'):
             if not fund_exists and not prices_exists:
                 st.error("❌ No data files found!")
                 st.info("📌 Please fetch and process data first in the **Data Sources** and **Data Processing** tabs")
@@ -535,7 +535,7 @@ def show_data_management():
                                     checker.score_to_status(fund_scores['timeliness'])[0]
                                 ]
                             })
-                            st.dataframe(breakdown_df, use_container_width=True)
+                            st.dataframe(breakdown_df, use_container_width='stretch')
                             st.caption(f"📦 Records: {fund_scores.get('record_count', 'N/A')}")
                     
                     # ===== PRICE DATA QUALITY =====
@@ -570,7 +570,7 @@ def show_data_management():
                                     checker.score_to_status(price_scores['timeliness'])[0]
                                 ]
                             })
-                            st.dataframe(breakdown_df, use_container_width=True)
+                            st.dataframe(breakdown_df, use_container_width='stretch')
                             st.caption(f"📦 Records: {price_scores.get('record_count', 'N/A')}")
                     
                     # ===== RECOMMENDATIONS =====
@@ -938,7 +938,7 @@ def _show_performance_monitoring(account):
                     hovermode="x unified", height=400,
                     legend=dict(orientation="h", yanchor="bottom", y=1.02)
                 )
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, use_container_width='stretch')
 
                 # ── Daily P&L chart ───────────────────────────────────────────
                 st.markdown("#### P&L hàng ngày")
@@ -955,7 +955,7 @@ def _show_performance_monitoring(account):
                         xaxis_title="Date", yaxis_title="P&L ($)",
                         height=300
                     )
-                    st.plotly_chart(fig2, use_container_width=True)
+                    st.plotly_chart(fig2, use_container_width='stretch')
 
                 # ── Positions table ───────────────────────────────────────────
                 st.markdown("#### Vị thế hiện tại")
@@ -993,7 +993,7 @@ def _show_performance_monitoring(account):
                     if "unrealized_pl" in pos_df_show.columns:
                         styled = styled.applymap(_color_pnl, subset=["unrealized_pl"])
 
-                    st.dataframe(styled, use_container_width=True, height=350)
+                    st.dataframe(styled, use_container_width='stretch', height=350)
 
                     # ── P&L bar chart per symbol ──────────────────────────────
                     if "unrealized_pl" in pos_df_show.columns:
@@ -1010,7 +1010,7 @@ def _show_performance_monitoring(account):
                             xaxis_title="Symbol", yaxis_title="Unrealized P&L ($)",
                             height=350
                         )
-                        st.plotly_chart(fig3, use_container_width=True)
+                        st.plotly_chart(fig3, use_container_width='stretch')
                 else:
                     st.info("Chưa có vị thế nào. Lệnh OPG sẽ khớp khi thị trường mở cửa.")
 
@@ -1144,7 +1144,7 @@ def _show_strategy_execution(account):
                                     weights_out[["gvkey", "weight", "predicted_return"]]
                                     .sort_values("weight", ascending=False)
                                     .style.format({"weight": "{:.2%}", "predicted_return": "{:.4f}"}),
-                                    use_container_width=True,
+                                    use_container_width='stretch',
                                     height=250,
                                 )
                     except Exception as e:
@@ -1245,7 +1245,7 @@ def _show_strategy_execution(account):
         st.dataframe(
             weights_df.sort_values("weight", ascending=False)
             .style.format({"weight": "{:.2%}"}),
-            use_container_width=True,
+            use_container_width='stretch',
             height=300,
         )
 
@@ -1261,7 +1261,7 @@ def _show_strategy_execution(account):
                      title=f"Top-10 Allocation ({top_n_filter} stocks)", hole=0.35)
         fig.update_traces(textposition="inside", textinfo="percent+label")
         fig.update_layout(showlegend=False, margin=dict(t=40, b=0, l=0, r=0))
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width='stretch')
 
     target_weights = {
         str(r["gvkey"]): float(r["weight"])
@@ -1369,7 +1369,7 @@ def show_portfolio_analysis():
         )
         
         # Fetch button
-        fetch_clicked = st.button("🔄 Fetch Data", type="primary", use_container_width=True)
+        fetch_clicked = st.button("🔄 Fetch Data", type="primary", use_container_width='stretch')
     
     # Main content
     if not fetch_clicked:
@@ -1469,7 +1469,7 @@ def _show_price_analysis(price_data: pd.DataFrame, tickers: list, start_date, en
             hovermode='x unified',
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width='stretch')
         
         # Performance metrics
         total_returns = ((chart_data.iloc[-1] / chart_data.iloc[0]) - 1) * 100
@@ -1485,7 +1485,7 @@ def _show_price_analysis(price_data: pd.DataFrame, tickers: list, start_date, en
             st.dataframe(
                 returns_df.style.format({'Return (%)': '{:.2f}%'})
                 .background_gradient(cmap='RdYlGn', subset=['Return (%)']),
-                use_container_width=True
+                use_container_width='stretch'
             )
         
         with col2:
@@ -1504,7 +1504,7 @@ def _show_price_analysis(price_data: pd.DataFrame, tickers: list, start_date, en
                     'Min Price': '${:.2f}',
                     'Max Price': '${:.2f}'
                 }),
-                use_container_width=True
+                use_container_width='stretch'
             )
 
     with tab2:
@@ -1542,7 +1542,7 @@ def _show_price_analysis(price_data: pd.DataFrame, tickers: list, start_date, en
                 'VaR (95%)': '{:.4f}',
                 'CVaR (95%)': '{:.4f}'
             }).background_gradient(cmap='YlOrRd', subset=['Volatility (Annual)', 'Max Drawdown']),
-            use_container_width=True
+            use_container_width='stretch'
         )
         
         # Drawdown chart
@@ -1571,7 +1571,7 @@ def _show_price_analysis(price_data: pd.DataFrame, tickers: list, start_date, en
             title='Portfolio Drawdown Over Time'
         )
         fig.update_layout(yaxis_tickformat='.2%', hovermode='x unified')
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width='stretch')
 
     with tab3:
         st.subheader("📊 Returns Analysis")
@@ -1592,7 +1592,7 @@ def _show_price_analysis(price_data: pd.DataFrame, tickers: list, start_date, en
             labels={'value': 'Cumulative Return', 'datadate': 'Date'}
         )
         fig.update_layout(hovermode='x unified')
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width='stretch')
         
         # Returns statistics
         st.subheader("Returns Statistics")
@@ -1627,7 +1627,7 @@ def _show_price_analysis(price_data: pd.DataFrame, tickers: list, start_date, en
                     'Min': '{:.4f}',
                     'Max': '{:.4f}'
                 }).background_gradient(cmap='RdYlGn', subset=['Sharpe Ratio']),
-                use_container_width=True
+                use_container_width='stretch'
             )
         else:
             st.warning("No returns data available")
@@ -1654,7 +1654,7 @@ def _show_price_analysis(price_data: pd.DataFrame, tickers: list, start_date, en
             labels=dict(color="Correlation")
         )
         fig.update_layout(width=800, height=600)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width='stretch')
         
         # Summary
         st.subheader("Correlation Summary")
